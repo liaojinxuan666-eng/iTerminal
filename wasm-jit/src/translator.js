@@ -91,7 +91,7 @@ function findBlocks(elf) {
 
             // 解析指令类型判断是否结束块（必须用 classifyAt 算绝对目标）
             const info = classifyAt(w, pc);
-            if (info.kind === 'bcond' || info.kind === 'b') {
+            if (info.kind === 'bcond' || info.kind === 'b' || info.kind === 'cbz') {
                 leaders.add(info.target);
                 leaders.add(pc + 4);
                 queue.push(info.target, pc + 4);
@@ -134,6 +134,16 @@ function classify(w) {
         const imm = SEXT(B(w, 23, 5), 19) << 2;
         return { kind: 'bcond', target: 0, imm };
     }
+    // CBZ / CBNZ (32/64-bit): sf 0x34/0x35 (w), 0xb4/0xb5 (x)
+    {
+        const top = (w & 0x7f000000) >>> 0;
+        if (top === 0x34000000 || top === 0x35000000 ||
+            top === 0xb4000000 || top === 0xb5000000) {
+            const imm = SEXT(B(w, 23, 5), 19) << 2;
+            const nonzero = (top === 0x35000000 || top === 0xb5000000);
+            return { kind: 'cbz', target: 0, imm, nonzero };
+        }
+    }
     if (w === 0xd65f03c0) return { kind: 'ret' };
     if (((w & 0xff000000) >>> 0) === 0xd4000000) return { kind: 'svc' };
     return { kind: 'other' };
@@ -142,7 +152,7 @@ function classify(w) {
 /** 带 pc 的精确分类（把相对偏移算成绝对地址） */
 function classifyAt(w, pc) {
     const c = classify(w);
-    if (c.kind === 'b' || c.kind === 'bl' || c.kind === 'bcond') c.target = pc + c.imm;
+    if (c.kind === 'b' || c.kind === 'bl' || c.kind === 'bcond' || c.kind === 'cbz') c.target = pc + c.imm;
     return c;
 }
 
@@ -152,7 +162,11 @@ const G = {
     SP: 31,           // r31 作为 SP 时的 global
     FLAGS: 32,        // NZCV: bit0=N bit1=Z bit2=C bit3=V
     RETADDR: 33,      // bl 返回的块号（i32）
-    COUNT: 34,
+    SCRATCH: 34,      // 地址计算临时寄存器 base（i64）
+    RETURN: 35,       // bl 返回地址 guest 值（i64，供 ret 读取 lr）
+    SCRATCH2: 36,     // pair 访存槽0 地址（i64）
+    CALLSP: 37,       // 影子调用栈指针（i32，指向 WASM 内存）
+    COUNT: 38,
 };
 const gIdx = r => r; // x0..x30
 
@@ -224,15 +238,35 @@ function translateBlock(blocks, blockIdx, ctx) {
         const ci = classifyAt(w, pc);
 
         if (ci.kind === 'ret') {
-            // 返回块号在 RETADDR global
-            emit([OP.global_get, ...uleb(G.RETADDR), OP.return]);
+            // 从影子调用栈弹出返回块号：CALLSP -= 4; blk = i32.load(CALLSP)
+            emit([
+                OP.global_get, ...uleb(G.CALLSP), OP.i32_const, ...sleb(4), OP.i32_sub,
+                OP.global_set, ...uleb(G.CALLSP),
+                OP.global_get, ...uleb(G.CALLSP), OP.i32_load, 2, 0,
+                OP.return,
+            ]);
             break;
         }
-        if (ci.kind === 'b' || ci.kind === 'bcond') {
+        if (ci.kind === 'b' || ci.kind === 'bcond' || ci.kind === 'cbz') {
             const tgtBlk = addrToBlock.get(ci.target);
             const fallBlk = nextAddrOf(pc);
             if (ci.kind === 'b') {
                 emit([OP.i32_const, ...sleb(tgtBlk === undefined ? -1 : tgtBlk), OP.return]);
+            } else if (ci.kind === 'cbz') {
+                // cbz: 寄存器为 0 跳转；cbnz: 非 0 跳转。32 位时取低 32 位。
+                const rt = B(w, 4, 0);
+                const sf = (w >>> 31) & 1;
+                emit(getReg(rt, false));
+                let isZero;
+                if (!sf) { emit([OP.i32_wrap_i64]); isZero = OP.i32_eqz; } // w 寄存器看低 32 位
+                else isZero = OP.i64_eqz;
+                if (!ci.nonzero) emit([isZero]);        // cbz: val==0
+                else emit([isZero, OP.i32_eqz]);        // cbnz: !(val==0)
+                emit([OP.if, VT.i32]);
+                emit([OP.i32_const, ...sleb(tgtBlk === undefined ? -1 : tgtBlk)]);
+                emit([OP.else]);
+                emit([OP.i32_const, ...sleb(fallBlk)]);
+                emit([OP.end, OP.return]);
             } else {
                 const cond = B(w, 3, 0);
                 // (cond ? tgt : fall)
@@ -249,8 +283,13 @@ function translateBlock(blocks, blockIdx, ctx) {
             const tgtBlk = addrToBlock.get(ci.target);
             const retBlk = nextAddrOf(pc);
             emit([
-                OP.i32_const, ...sleb(retBlk), OP.global_set, ...uleb(G.RETADDR), // 保存返回块
-                OP.i64_const, ...sleb(pc + 4 - ctx.bias), ...setReg(30, false),   // LR = guest 地址
+                // 压栈：i32.store(CALLSP, retBlk); CALLSP += 4
+                OP.global_get, ...uleb(G.CALLSP),
+                OP.i32_const, ...sleb(retBlk), OP.i32_store, 2, 0,
+                OP.global_get, ...uleb(G.CALLSP), OP.i32_const, ...sleb(4), OP.i32_add,
+                OP.global_set, ...uleb(G.CALLSP),
+                // LR = guest 地址（写入 x30）
+                OP.i64_const, ...sleb(pc + 4 - ctx.bias), ...setReg(30, false),
                 OP.i32_const, ...sleb(tgtBlk === undefined ? -1 : tgtBlk), OP.return,
             ]);
             break;
@@ -313,8 +352,8 @@ function translateInsn(w, pc, ctx) {
         const isAdrp = ((w & 0x80000000) >>> 0) !== 0;
         const immlo = B(w, 30, 29), immhi = B(w, 23, 5);
         let imm = SEXT((immhi << 2) | immlo, 21);
-        if (isAdrp) imm = (imm << 12) & ~0xfff;
-        const guestAddr = isAdrp ? imm : pc + imm;
+        // ADRP: 目标页基址 = (pc & ~0xfff) + (imm << 12)；ADR: pc + imm
+        const guestAddr = isAdrp ? ((pc & ~0xfff) + (imm << 12)) : (pc + imm);
         o.push(OP.i64_const, ...sleb(guestAddr - ctx.bias), ...setReg(rd, false));
         return o;
     }
@@ -345,8 +384,12 @@ function translateInsn(w, pc, ctx) {
         const shiftType = B(w, 23, 22), imm6 = B(w, 15, 10);
         o.push(...getReg(rn, rn === 31));
         o.push(...getReg(rm, false));
-        if (shiftType === 1 && imm6) { o.push(OP.i64_const, ...sleb(imm6), OP.i64_shl); }
-        else if (shiftType === 2 && imm6) { o.push(OP.i64_const, ...sleb(imm6), OP.i64_shr_u); }
+        // shiftType: 0=LSL, 1=LSR, 2=ASR
+        if (imm6) {
+            if (shiftType === 0) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shl);
+            else if (shiftType === 1) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shr_u);
+            else if (shiftType === 2) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shr_s);
+        }
         if (setFlags) o.push(OP.call, ...uleb(ctx.setflagsIdx));
         else o.push(isSub ? OP.i64_sub : OP.i64_add);
         o.push(...setReg(rd, rd === 31));
@@ -373,6 +416,34 @@ function translateInsn(w, pc, ctx) {
         return o;
     }
 
+    // ---- CSEL / CSINC（条件选择）----
+    // CSEL: Rd = cond ? Rn : Rm ; 编码 0x1a800000
+    // CSINC: Rd = cond ? Rn : Rm+1 ; 编码 0x1a800400（常用于 CSET）
+    if (((w & 0x7fe00c00) >>> 0) === 0x1a800000 || ((w & 0x7fe00c00) >>> 0) === 0x1a800400) {
+        const isInc = ((w & 0x7fe00c00) >>> 0) === 0x1a800400;
+        const sf = (w >>> 31) & 1;
+        const cond = B(w, 15, 12);
+        const rn = B(w, 9, 5), rm = B(w, 20, 16);
+        const get = r => getReg(r, false);
+        const set = r => setReg(r, false);
+        // 压入两个候选值（cond 真选第一个）
+        o.push(...get(rn));
+        if (isInc) {
+            o.push(...get(rm), OP.i64_const, ...sleb(1), OP.i64_add);
+        } else {
+            o.push(...get(rm));
+        }
+        // 条件（i32 0/1）
+        o.push(...emitCond(cond));
+        // 32 位结果需截断到低 32 位并零扩展
+        o.push(OP.select);
+        if (!sf) {
+            o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u);
+        }
+        o.push(...set(rd));
+        return o;
+    }
+
     // ---- UDIV / SDIV ----
     if (((w & 0x7fe0fc00) >>> 0) === 0x1ac00800 || ((w & 0x7fe0fc00) >>> 0) === 0x1ac00c00) {
         const isSigned = ((w >> 10) & 1) === 1;
@@ -382,24 +453,78 @@ function translateInsn(w, pc, ctx) {
         return o;
     }
 
-    // ---- LDR/STR 立即数（含 pre-index，unscaled）----
+    // ---- LDR/STR 立即数（unsigned offset / unscaled / pre-index / post-index）----
+    // 用 SCRATCH 保存 base，避免 WASM 栈无法复制的问题。
+    // 策略：base→SCRATCH；若写回则单独重算 Rn=base+imm；再用 SCRATCH 重算 EA 做访存。
     if (((w & 0x3b000000) >>> 0) === 0x39000000 || ((w & 0x3b000000) >>> 0) === 0x38000000) {
-        const size = B(w, 31, 30);
+        const size = B(w, 31, 30);          // 0=byte 1=half 2=word 3=dword
         const isLoad = ((w >> 22) & 1) === 1;
-        const imm9 = SEXT(B(w, 20, 12), 9);
-        const opc = B(w, 23, 22);
-        const isUnscaled = ((w >> 24) & 1) === 1;
-        let imm = isUnscaled ? imm9 : B(w, 21, 10) * (1 << size);
-        o.push(...getReg(rn, true), OP.i64_const, ...sleb(imm), OP.i64_add);
+        const isUnscaled = ((w & 0x3b000000) >>> 0) === 0x38000000;
+        const addrMode = B(w, 11, 10);      // 00=unscaled offset, 01=post-index, 11=pre-index
+        let imm = isUnscaled ? SEXT(B(w, 20, 12), 9) : B(w, 21, 10) * (1 << size);
+        const isPost = isUnscaled && addrMode === 1;   // post-index: EA=base, Rn=base+imm
+        const isPre = isUnscaled && addrMode === 3;    // pre-index: EA=base+imm, Rn=base+imm
+        const writeback = isPost || isPre;
+
+        // base → SCRATCH
+        o.push(...getReg(rn, true), OP.global_set, ...uleb(G.SCRATCH));
+        // 写回 Rn = base + imm
+        if (writeback) {
+            o.push(OP.global_get, ...uleb(G.SCRATCH), OP.i64_const, ...sleb(imm), OP.i64_add, ...setReg(rn, true));
+        }
+        // EA（i32）：post 用 base，其余用 base+imm
+        o.push(OP.global_get, ...uleb(G.SCRATCH));
+        if (!isPost) o.push(OP.i64_const, ...sleb(imm), OP.i64_add);
+        o.push(OP.i32_wrap_i64);
+
         if (isLoad) {
-            o.push(size === 3 ? OP.i64_load : size === 2 ? OP.i64_load32_u : size === 1 ? OP.i64_load16_u : OP.i64_load8_u);
-            // align = log2(访问宽度)，i64 为 3；offset = 0；地址已由前面的 add 算好
-            o.push(size === 3 ? 3 : size === 2 ? 2 : size === 1 ? 1 : 0, 0);
-            o.push(...setReg(rd, false));
+            const op = size === 3 ? OP.i64_load : size === 2 ? OP.i64_load32_u
+                     : size === 1 ? OP.i64_load16_u : OP.i64_load8_u;
+            o.push(op, size, 0, ...setReg(rd, false));
         } else {
             o.push(...getReg(rd, false));
-            o.push(size === 3 ? OP.i64_store : size === 2 ? OP.i64_store32 : size === 1 ? OP.i64_store16 : OP.i64_store8);
-            o.push(0x00, 0x00); // memarg align=0 offset=0
+            const op = size === 3 ? OP.i64_store : size === 2 ? OP.i64_store32
+                     : size === 1 ? OP.i64_store16 : OP.i64_store8;
+            o.push(op, size, 0);
+        }
+        return o;
+    }
+
+    // ---- LDP / STP（load/store pair）----
+    if (((w & 0x3a000000) >>> 0) === 0x28000000) {
+        const isLoad = ((w >> 22) & 1) === 1;
+        const opc = B(w, 31, 30);
+        const is64 = (opc & 2) !== 0;      // opc=10/01→64位, opc=00→32位
+        const slot = is64 ? 8 : 4;
+        const imm7 = SEXT(B(w, 21, 15), 7) * slot;
+        const mode = B(w, 24, 23);         // 01=post-index, 10=signed offset, 11=pre-index
+        const rt = B(w, 4, 0), rt2 = B(w, 14, 10);
+        const isPost = mode === 1, isPre = mode === 3;
+        const writeback = isPost || isPre;
+
+        // base → SCRATCH
+        o.push(...getReg(rn, true), OP.global_set, ...uleb(G.SCRATCH));
+        // 写回 Rn = base + imm7
+        if (writeback) {
+            o.push(OP.global_get, ...uleb(G.SCRATCH), OP.i64_const, ...sleb(imm7), OP.i64_add, ...setReg(rn, true));
+        }
+        // 槽0 EA：post 用 base，其余 base+imm7；存入 SCRATCH2
+        o.push(OP.global_get, ...uleb(G.SCRATCH));
+        if (!isPost) o.push(OP.i64_const, ...sleb(imm7), OP.i64_add);
+        o.push(OP.global_set, ...uleb(G.SCRATCH2));
+
+        const loadOp = is64 ? OP.i64_load : OP.i64_load32_u;
+        const storeOp = is64 ? OP.i64_store : OP.i64_store32;
+        const align = is64 ? 3 : 2;
+
+        if (isLoad) {
+            o.push(OP.global_get, ...uleb(G.SCRATCH2), OP.i32_wrap_i64, loadOp, align, 0, ...setReg(rt, false));
+            o.push(OP.global_get, ...uleb(G.SCRATCH2), OP.i64_const, ...sleb(slot), OP.i64_add,
+                   OP.i32_wrap_i64, loadOp, align, 0, ...setReg(rt2, false));
+        } else {
+            o.push(OP.global_get, ...uleb(G.SCRATCH2), OP.i32_wrap_i64, ...getReg(rt, false), storeOp, align, 0);
+            o.push(OP.global_get, ...uleb(G.SCRATCH2), OP.i64_const, ...sleb(slot), OP.i64_add,
+                   OP.i32_wrap_i64, ...getReg(rt2, false), storeOp, align, 0);
         }
         return o;
     }
@@ -431,10 +556,14 @@ function translateELF(pathOrBuffer, opts = {}) {
 
     // globals
     const gInit = i => [OP.i32_const, ...sleb(i)];
-    for (let i = 0; i < 31; i++) m.defineGlobal(VT.i64, true, [OP.i64_const, ...sleb(0)]);
-    m.defineGlobal(VT.i64, true, [OP.i64_const, ...sleb(memPages * 65536 - 4096)]); // SP
-    m.defineGlobal(VT.i32, true, gInit(0)); // FLAGS
-    m.defineGlobal(VT.i32, true, gInit(0)); // RETADDR
+    for (let i = 0; i < 31; i++) m.defineGlobal(VT.i64, true, [OP.i64_const, ...sleb(0)]); // x0..x30
+    m.defineGlobal(VT.i64, true, [OP.i64_const, ...sleb(memPages * 65536 - 4096)]); // SP (31)
+    m.defineGlobal(VT.i32, true, gInit(0)); // FLAGS (32)
+    m.defineGlobal(VT.i32, true, gInit(0)); // RETADDR (33)
+    m.defineGlobal(VT.i64, true, [OP.i64_const, ...sleb(0)]); // SCRATCH (34)
+    m.defineGlobal(VT.i64, true, [OP.i64_const, ...sleb(0)]); // RETURN (35)
+    m.defineGlobal(VT.i64, true, [OP.i64_const, ...sleb(0)]); // SCRATCH2 (36)
+    m.defineGlobal(VT.i32, true, [OP.i32_const, ...sleb(memPages * 65536 - 8192)]); // CALLSP (37)
 
     // helper: setflags_sub(a,b) -> r (同时写 FLAGS)
     const setflagsIdx = m.defineFunc([VT.i64, VT.i64], [VT.i64]);

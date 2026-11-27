@@ -63,9 +63,18 @@ $ node run.js /workspace/linux-abi/tests/verify
 test: mul/div/call/uname/write...
 PASS: all AArch64 ops verified!
 [wasm-jit] guest 退出码=12        ← 5! = 120 正确
+
+$ node run.js /workspace/linux-abi/tests/real_c
+K
+[wasm-jit] guest 退出码=71        ← 真实 gcc 编译的 C，15+42+14=71 正确
+
+$ node -e "run('tests/echo',{input:Buffer.from('HelloTerm!')})"
+输出 "HelloTerm!"，退出码 10   ← read syscall 输入链路正确
 ```
 
 `verify` 覆盖：**MADD、UDIV、SUBS/CMP、B.cond、BL/RET 函数调用、uname/write/exit syscall、退出码传递**。
+
+**关键跨越 — `real_c.c`**：这是由标准 `aarch64-linux-gnu-gcc -O1 -mgeneral-regs-only` 编译的**真实 C 代码**（不是手写汇编），包含数组、结构体、指针算术、多层嵌套函数调用、局部变量栈帧。它跑通意味着翻译器已经能处理编译器生成的真实栈操作和对访存，而不只是精心构造的汇编片段。
 
 **浏览器宿主**（`ios-bridge/guest.js`）也在 Node 模拟环境跑通同样结果，证明 Swift 桥接层吃的接口是好的。
 
@@ -78,6 +87,13 @@ PASS: all AArch64 ops verified!
 - WASM i64 参数是 BigInt，`Buffer.from(buf, bigint)` 拿不到数据 → JS 侧转 Number
 - 块发现用了未算绝对地址的 classify，把目标 `0x4000f0` 算成 `0x0`
 - exit syscall 后的字符串被当指令解码 → 常量追踪 x8 识别 exit 并停扫
+- **影子调用栈**：原来用单个 `RETADDR` global 存返回地址，嵌套调用会覆盖 → 改用 WASM 线性内存中的影子栈（CALLSP 指针），支持任意深度函数调用
+- **ADRP 漏加 PC 页基址**：`guestAddr` 直接用 imm，少算了 `pc & ~0xfffff` → 修正为 `(pc & ~0xfff) + (imm<<12)`
+- **ADD 移位寄存器 LSL 缺失**：shiftType=0（LSL）分支没实现，`add x1,x2,x0,lsl#3` 退化成不加倍 → 补全 LSL/LSR/ASR
+- **LDR/STR 寻址模式判断错误**：用 bits[23:22]（load/store 位）区分 pre/post，实际应看 bits[11:10] → 修正，`ldur` 负偏移才正确
+- **访存地址缺 `i32_wrap_i64`**：WASM 内存地址必须是 i32，原来直接喂 i64（手写汇编测试无访存所以没暴露）→ 补 LDP/STP 与地址转换
+- 补 `OP.i32_add`/`i32_sub`（ret 弹栈需要）
+- 补 **CSEL/CSINC** 条件选择、**CBZ/CBNZ** 条件分支指令
 
 ---
 
@@ -87,15 +103,21 @@ PASS: all AArch64 ops verified!
 wasm-jit/
 ├── src/
 │   ├── wasm-encoder.js      # 手写 WASM 二进制编码器（无第三方依赖）
-│   └── translator.js        # ELF 解析 + 基本块发现 + AArch64→WASM 翻译
-├── run.js                   # Node 宿主：syscall 实现 + 块调度 + CLI
+│   ├── translator.js        # ELF 解析 + 基本块发现 + AArch64→WASM 翻译
+│   └── syscalls.js          # 可复用 syscall 表（Node/iOS 共用逻辑）
+├── run.js                   # Node 宿主：块调度 + CLI
 ├── Scripts/translate.sh     # 离线翻译脚本
 ├── ios-bridge/
 │   ├── guest.js             # WKWebView 内宿主（syscall→Swift 桥）
 │   ├── WasmGuestBridge.swift# Swift 侧 WKWebView 桥接骨架
 │   └── assets/*.wasm        # 预翻译的测试模块
-├── tests/                   # 从 linux-abi 复制的测试二进制
+├── tests/                   # 测试二进制
 └── README.md
+
+测试源码在相邻的 /workspace/linux-abi/tests/：
+  minimal.S / verify.S      # 手写汇编（早期验证）
+  crt.S + real_c.c          # 真实 gcc 编译的 C（数组/结构体/调用栈）
+  crt.S + echo.c            # read syscall 输入链路
 ```
 
 ## 5. 用法

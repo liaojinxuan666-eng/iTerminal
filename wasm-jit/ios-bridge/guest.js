@@ -24,6 +24,8 @@
             this.exitCode = null;
             this.output = [];
             this.onSyscall = options.onSyscall || null; // -> (name, payload) => result
+            this.input = options.input || null;          // read syscall 的输入数据
+            this.inputPos = 0;
             this.steps = 0;
             this.maxSteps = options.maxSteps || 50_000_000;
         }
@@ -55,6 +57,16 @@
                     this.output.push({ fd: a0, text, bytes: Array.from(bytes) });
                     if (this.onSyscall) this.onSyscall('write', { fd: a0, text });
                     result = a2;
+                    break;
+                }
+                case 63: { // read
+                    if (a0 !== 0) { result = -9; break; } // EBADF
+                    if (!this.input) { result = 0; break; } // EOF
+                    const u = new Uint8Array(this.memory.buffer);
+                    const n = Math.min(a2, this.input.length - this.inputPos);
+                    for (let i = 0; i < n; i++) u[a1 + i] = this.input[this.inputPos + i];
+                    this.inputPos += n;
+                    result = n;
                     break;
                 }
                 case 93: // exit
@@ -89,9 +101,12 @@
     }
 
     GuestProcess.SYSCALLS = {
-        64: 'write', 93: 'exit', 94: 'exit_group',
-        172: 'getpid', 178: 'gettid', 189: 'uname', 214: 'brk',
-        215: 'munmap', 222: 'mmap', 96: 'getcwd',
+        63: 'read', 64: 'write',
+        93: 'exit', 94: 'exit_group',
+        169: 'gettimeofday',
+        172: 'getpid', 176: 'getuid', 177: 'geteuid', 178: 'gettid',
+        189: 'uname', 214: 'brk', 215: 'mmap', 216: 'munmap',
+        80: 'fstat', 96: 'getcwd',
     };
 
     global.GuestProcess = GuestProcess;
