@@ -56,5 +56,19 @@ runExitBatch('asm');   // MOVZ/MOVK/EOR/ANDI/UBFX/LSL-imm/BIC
 runExitBatch('asm2');  // UBFIZ/变量移位/SBFX/MVN/EON
 check('asm:regldr', run(path.join(asmDir, 'elf_asm_regldr')).exitCode, 0x33);
 
+/* ---- 3. 文件系统 syscall 端到端 ---- */
+console.log('\n[3] 文件系统 syscall');
+const rootfs = path.join(HERE, 'rootfs');
+{
+    const r = run(path.join(HERE, 'fileio'), { rootfs });
+    check('fileio.exit', r.exitCode, 7);
+    check('fileio.out', r.text, 'WASMJIT\n80WAS/');
+}
+{
+    const r = run(path.join(HERE, 'getdents'), { rootfs });
+    check('getdents.exit', r.exitCode, 2);
+    check('getdents.out', r.text, '\u0008p\u0008v');
+}
+
 console.log(`\n结果: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

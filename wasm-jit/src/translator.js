@@ -91,7 +91,7 @@ function findBlocks(elf) {
 
             // 解析指令类型判断是否结束块（必须用 classifyAt 算绝对目标）
             const info = classifyAt(w, pc);
-            if (info.kind === 'bcond' || info.kind === 'b' || info.kind === 'cbz') {
+            if (info.kind === 'bcond' || info.kind === 'b' || info.kind === 'cbz' || info.kind === 'tbz') {
                 leaders.add(info.target);
                 leaders.add(pc + 4);
                 queue.push(info.target, pc + 4);
@@ -144,6 +144,21 @@ function classify(w) {
             return { kind: 'cbz', target: 0, imm, nonzero };
         }
     }
+    // TBZ / TBNZ (test bit and branch): b5(bit31)=0->32位 1->64位, bit24(op) 区分 z/nz
+    // 编码 b5 011011 b40 imm14(14) Rt(5)，掩码 0x7f000000 保留 bit24:
+    //   b5=0: 0x36000000(TBZ) / 0x37000000(TBNZ)
+    //   b5=1: 0xb6000000(TBZ) / 0xb7000000(TBNZ)
+    {
+        const top = (w & 0x7f000000) >>> 0;
+        if (top === 0x36000000 || top === 0x37000000 ||
+            top === 0xb6000000 || top === 0xb7000000) {
+            const imm = SEXT(B(w, 18, 5), 14) << 2;   // imm14 在 bits[18:5]
+            const bit = (((w >>> 31) & 1) << 5) | B(w, 23, 19); // bit_pos = b5:b40 (b5=bit31, b40=bits[23:19])
+            const is64 = (w >>> 31) & 1;
+            const nonzero = (top & 0x01000000) !== 0;  // bit24=1 -> TBNZ
+            return { kind: 'tbz', target: 0, imm, bit, is64, nonzero, rt: B(w, 4, 0) };
+        }
+    }
     if (w === 0xd65f03c0) return { kind: 'ret' };
     if (((w & 0xff000000) >>> 0) === 0xd4000000) return { kind: 'svc' };
     return { kind: 'other' };
@@ -152,7 +167,7 @@ function classify(w) {
 /** 带 pc 的精确分类（把相对偏移算成绝对地址） */
 function classifyAt(w, pc) {
     const c = classify(w);
-    if (c.kind === 'b' || c.kind === 'bl' || c.kind === 'bcond' || c.kind === 'cbz') c.target = pc + c.imm;
+    if (c.kind === 'b' || c.kind === 'bl' || c.kind === 'bcond' || c.kind === 'cbz' || c.kind === 'tbz') c.target = pc + c.imm;
     return c;
 }
 
@@ -274,11 +289,22 @@ function translateBlock(blocks, blockIdx, ctx) {
             ]);
             break;
         }
-        if (ci.kind === 'b' || ci.kind === 'bcond' || ci.kind === 'cbz') {
+        if (ci.kind === 'b' || ci.kind === 'bcond' || ci.kind === 'cbz' || ci.kind === 'tbz') {
             const tgtBlk = addrToBlock.get(ci.target);
             const fallBlk = nextAddrOf(pc);
             if (ci.kind === 'b') {
                 emit([OP.i32_const, ...sleb(tgtBlk === undefined ? -1 : tgtBlk), OP.return]);
+            } else if (ci.kind === 'tbz') {
+                // tbz/tbnz: 测 rt 的第 bit 位。tbz: 位为 0 跳转；tbnz: 位为 1 跳转。
+                emit(getReg(ci.rt, false));                 // i64 val
+                emit([OP.i64_const, ...sleb(BigInt(ci.bit)), OP.i64_shr_u,
+                      OP.i64_const, ...sleb(1n), OP.i64_and, OP.i64_eqz]); // 位==0 -> 1
+                if (ci.nonzero) emit([OP.i32_eqz]);          // tbnz: 位!=0
+                emit([OP.if, VT.i32]);
+                emit([OP.i32_const, ...sleb(tgtBlk === undefined ? -1 : tgtBlk)]);
+                emit([OP.else]);
+                emit([OP.i32_const, ...sleb(fallBlk)]);
+                emit([OP.end, OP.return]);
             } else if (ci.kind === 'cbz') {
                 // cbz: 寄存器为 0 跳转；cbnz: 非 0 跳转。32 位时取低 32 位。
                 const rt = B(w, 4, 0);
@@ -417,9 +443,44 @@ function translateInsn(w, pc, ctx) {
         return o;
     }
 
+    // ---- ADD/SUB 扩展寄存器 [Rn, Rm{, extend {#imm3}}] ----
+    // 编码 sf op S 01011 rm option(3) imm3 rn rd，bit21=1 区分于移位寄存器(bit21=0)
+    // option: 0=UXTB 1=UXTH 2=UXTW 3=UXTX/LSL 4=SXTB 5=SXTH 6=SXTW 7=SXTX
+    if ((((w & 0x7f000000) >>> 0) === 0x0b000000 || ((w & 0x7f000000) >>> 0) === 0x4b000000 ||
+         ((w & 0x7f000000) >>> 0) === 0x2b000000 || ((w & 0x7f000000) >>> 0) === 0x6b000000) &&
+        ((w >> 21) & 1) === 1) {
+        const isSub = ((w >> 30) & 1) === 1;
+        const setFlags = ((w >> 29) & 1) === 1;
+        const option = B(w, 15, 13), imm3 = B(w, 12, 10);
+        o.push(...getReg(rn, rn === 31));    // Rn：ADD 扩展形式 Rn=31 是 SP
+        o.push(...getReg(rm, false));
+        if (option === 0) { o.push(OP.i64_const, ...sleb(0xff), OP.i64_and); }        // UXTB
+        else if (option === 1) { o.push(OP.i64_const, ...sleb(0xffff), OP.i64_and); } // UXTH
+        else if (option === 2) { o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u); }      // UXTW
+        else if (option === 4) { o.push(OP.i64_const, ...sleb(0xff), OP.i64_and,
+                                        OP.i64_const, ...sleb(56), OP.i64_shl,
+                                        OP.i64_const, ...sleb(56), OP.i64_shr_s); }   // SXTB
+        else if (option === 5) { o.push(OP.i64_const, ...sleb(0xffff), OP.i64_and,
+                                        OP.i64_const, ...sleb(48), OP.i64_shl,
+                                        OP.i64_const, ...sleb(48), OP.i64_shr_s); }   // SXTH
+        else if (option === 6) { o.push(OP.i32_wrap_i64, OP.i64_extend_i32_s); }      // SXTW
+        // option===3: UXTX/LSL，无扩展
+        if (imm3) o.push(OP.i64_const, ...sleb(imm3), OP.i64_shl);
+        if (setFlags) {
+            o.push(OP.call, ...uleb(ctx.setflagsIdx));
+            if (rd === 31) o.push(OP.drop);
+            else o.push(...setReg(rd, false));
+        } else {
+            o.push(isSub ? OP.i64_sub : OP.i64_add);
+            o.push(...setReg(rd, false));
+        }
+        return o;
+    }
+
     // ---- ADD/SUB 移位寄存器 ----
     if (((w & 0x7f000000) >>> 0) === 0x0b000000 || ((w & 0x7f000000) >>> 0) === 0x4b000000 ||
         ((w & 0x7f000000) >>> 0) === 0x2b000000 || ((w & 0x7f000000) >>> 0) === 0x6b000000) {
+        if ((w >> 21) & 1) { o.push(OP.unreachable); return o; } // 扩展形式已在上面处理
         const isSub = ((w >> 30) & 1) === 1;
         const setFlags = ((w >> 29) & 1) === 1;
         const shiftType = B(w, 23, 22), imm6 = B(w, 15, 10);

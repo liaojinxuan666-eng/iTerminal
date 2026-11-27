@@ -60,19 +60,35 @@ final class WasmGuestBridge: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         // 消息处理器在 setup() 里注册（需要 self，不能在 init 阶段捕获）
     }
 
-    /// 在 WebView 就绪后调用，注册消息处理器并加载 guest.js
-    func setup(guestJS: URL, wasm: URL) async throws {
+    /// 在 WebView 就绪后调用，注册消息处理器并加载 guest.js。
+    /// - Parameters:
+    ///   - scripts: [syscalls.js, memfs.js, guest.js] 的 URL（按顺序注入）
+    ///   - wasm: 预翻译的 WASM 模块
+    ///   - fsFiles: 预置到内存 rootfs 的文件（guest 路径 -> Data）
+    ///   - entryBlock: guest 入口块号（由 translator 产出时记录）
+    func setup(scripts: [URL], wasm: URL, fsFiles: [String: Data] = [:],
+               entryBlock: Int = 0) async throws {
         let controller = webView.configuration.userContentController
         controller.removeScriptMessageHandler(forName: Self.messageName)
         controller.add(self, name: Self.messageName)
 
-        // 先注入 guest.js，再注入 wasm 字节（base64）
-        let js = try String(contentsOf: guestJS, encoding: .utf8)
+        // 按顺序拼接：syscalls.js（UMD 全局）-> memfs.js -> guest.js
+        let allJS = try scripts.map { try String(contentsOf: $0, encoding: .utf8) }
+                              .joined(separator: "\n;\n")
         let wasmData = try Data(contentsOf: wasm)
         let b64 = wasmData.base64EncodedString()
 
+        // 把预置文件编码成 { path: base64 } 字典，JS 侧解码为 Uint8Array
+        let fsInit = fsFiles.mapValues { $0.base64EncodedString() }
+        var fsInitJS = "{";
+        for (i, (k, v)) in fsInit.enumerated() {
+            if i > 0 { fsInitJS += "," }
+            fsInitJS += "\"\(k)\":\"\(v)\""
+        }
+        fsInitJS += "}"
+
         let bootstrap = """
-        \(js)
+        \(allJS)
         window.__wasmB64 = "\(b64)";
         function b64ToBytes(b64) {
           const bin = atob(b64);
@@ -82,13 +98,19 @@ final class WasmGuestBridge: NSObject, WKScriptMessageHandler, WKNavigationDeleg
         }
         window.__guestReady = false;
         (async () => {
+          const fsInit = \(fsInitJS);
+          const files = {};
+          for (const k of Object.keys(fsInit)) files[k] = b64ToBytes(fsInit[k]);
+          const memfs = createMemFS(files);
+          window.__memfs = memfs;
           window.__guest = new GuestProcess(b64ToBytes(window.__wasmB64), {
-            entryBlock: 0,
+            entryBlock: \(entryBlock),
+            fs: memfs,
             onSyscall: (name, payload) => {
               window.webkit.messageHandlers.iosHost.postMessage({
                 type: "syscall", name: name, payload: payload
               });
-              return window.__syscallReturn[name] || 0;
+              return 0;
             }
           });
           await window.__guest.init();

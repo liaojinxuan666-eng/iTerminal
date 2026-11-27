@@ -9,6 +9,7 @@
 const fs = require('fs');
 const { translateELF } = require('./src/translator');
 const { createSyscalls } = require('./src/syscalls');
+const { createNodeFS } = require('./src/hostfs-node');
 
 function run(elfPath, opts = {}) {
     const t = translateELF(elfPath, { memPages: opts.memPages || 16 });
@@ -27,7 +28,8 @@ function run(elfPath, opts = {}) {
         memory,
         input: opts.input || null,
         verbose: opts.verbose,
-        onWrite: (fd, bytes) => output.push(bytes),
+        fs: createNodeFS(opts.rootfs || null, opts.cwd || '/'),
+        onWrite: (fd, bytes) => output.push(Buffer.from(bytes)),  // 拷贝视图，避免被后续访存覆盖
         onExit: code => { exitCode = code; },
     });
 
@@ -66,7 +68,7 @@ function run(elfPath, opts = {}) {
 if (require.main === module) {
     const args = process.argv.slice(2);
     const elfPath = args[0];
-    if (!elfPath) { console.error('用法: node run.js <aarch64-elf> [--trace] [--verbose] [--dump out.wasm]'); process.exit(1); }
+    if (!elfPath) { console.error('用法: node run.js <aarch64-elf> [--trace] [--verbose] [--rootfs DIR] [--dump out.wasm]'); process.exit(1); }
     const opts = {
         trace: args.includes('--trace'),
         verbose: args.includes('--verbose'),
@@ -74,6 +76,8 @@ if (require.main === module) {
     };
     const di = args.indexOf('--dump');
     if (di >= 0) opts.dumpWasm = args[di + 1];
+    const ri = args.indexOf('--rootfs');
+    if (ri >= 0) opts.rootfs = args[ri + 1];
 
     try {
         const r = run(elfPath, opts);

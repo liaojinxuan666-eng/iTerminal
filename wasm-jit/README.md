@@ -96,11 +96,27 @@ $ node tests/regression.js
 | 符号加载 | LDRSB/LDRSH/LDRSW |
 | 寄存器变址访存 | `ldr/str [Rn, Rm{, extend {amount}}]`（`-O0` 下 `arr[i]` 的典型形式）|
 | MOVE 宽立即数 | MOVZ/MOVK/MOVN 完整区分 + 32 位零扩展 |
+| 条件测试分支 | TBZ/TBNZ（syscall 错误码检查的高频形式）|
+| ADD/SUB 扩展寄存器 | `[Rn, Rm{, uxtb/uxth/uxtw/sxtb/... {#imm3}}]`（数组下标计算）|
 | 其它 | NOP（对齐填充）、ANDS/条件标志 |
 
 现在真实 gcc 编译的复杂 C 探针（数组/结构体/位运算/除法/switch/符号加载）**全部指令 0 未实现**。
 
+### 文件系统 syscall 与 rootfs（2026-11-27）
+
+目标从"能跑计算程序"推进到"能跑文件操作程序"——这是终端生态的基础。syscall 层做了宿主解耦重构：
+
+- **`env.fs` 适配器**：syscall 逻辑与宿主文件系统分离。Node 用 `src/hostfs-node.js`（真实 fs + rootfs 沙箱路径映射 + `../` 防逃逸），iOS 用 `ios-bridge/memfs.js`（内存 fs，Swift 预注入文件）。两侧共用 `src/syscalls.js` 一份逻辑。
+- **补齐 syscall**：`openat/close/lseek/read/write/readv/writev/fstat/newfstatat/getcwd/getdents64/fcntl/ioctl`，按 AArch64 内核 ABI 精确填充 128 字节 `struct stat` 与 `linux_dirent64`。
+- **`syscalls.js` 去 Node 依赖**：用 `TextDecoder/TextEncoder` 替代 `Buffer`，并做成 UMD（Node `module.exports` / 浏览器 `globalThis.WasmSyscalls`），让 WKWebView 能直接复用。
+- **端到端验证**：`tests/fileio.c`（openat→read→write→fstat→lseek→getcwd）与 `tests/getdents.c`（目录列举）真实 gcc 编译后跑通，输出逐字节断言。
+
+rootfs 最小样本在 `tests/rootfs/`（`etc/version`、`etc/passwd`、`home/guest/note.txt`）。用 `node run.js tests/fileio --rootfs tests/rootfs` 运行。
+
 ### 调试中修掉的真实 bug（都是硬细节）
+- **TBZ/TBNZ 位号与掩码**：位号=`b5:b40`（b5=bit31，b40=bits[23:19]），imm14 在 bits[18:5]，op 区分位在 bit24（`0x7f000000` 掩码）。原实现字段全错，导致 syscall 负数错误码检查翻转、openat 成功后仍走错误分支
+- **ADD 扩展寄存器未实现**：`add x6,x6,w9,uxth`（bit21=1）被移位寄存器分支误吞，导致目录遍历偏移不累加、只返回 1 个条目 → 新增扩展寄存器分支（option 0..7 的 UXTB/UXTH/UXTW/SXTB...）
+- **文件类型判断用按位与**：Node stats.mode 里 S_IFREG=0x8000 与 S_IFLNK=0xa000 按位与重叠，普通文件被误判成符号链接（d_type=10 而非 8）→ 改为 `(mode & S_IFMT) === S_IFxxx`
 - **MOVK 识别掩码错误**：原掩码 `0x1f800000` 把区分 MOVZ/MOVK 的 opc 位（bit30:29）清掉，导致所有 MOVK 被当成 MOVZ，`movk` 拼大常量失效 → 改用 `0x7f800000` 按 opc 区分（MOVZ=MOVW opc=2 / MOVK opc=3 / MOVN opc=0）
 - **CMP 破坏 SP**：ADD/SUB 立即数里 Rd=31 正常是 SP，但 CMP/CMN（setflags=1）时 Rd=31 是 ZR。原实现把 CMP 结果写进 SP，导致栈指针被污染、访存越界 → setflags 且 rd=31 时改为 `drop`
 - **i64→Number 精度丢失**：syscall 桥接把 WASM i64(BigInt) 转 Number（>2^53 丢精度），exit code 低位被污染，恒为 0 → exit 走 BigInt 域 `& 0xff`（run.js / guest.js 均已修）
@@ -130,16 +146,19 @@ wasm-jit/
 ├── src/
 │   ├── wasm-encoder.js      # 手写 WASM 二进制编码器（无第三方依赖）
 │   ├── translator.js        # ELF 解析 + 基本块发现 + AArch64→WASM 翻译
-│   └── syscalls.js          # 可复用 syscall 表（Node/iOS 共用逻辑）
+│   ├── syscalls.js          # 可复用 syscall 表（UMD，Node/iOS 共用同一份逻辑）
+│   └── hostfs-node.js       # Node 文件适配器（真实 fs + rootfs 沙箱映射）
 ├── run.js                   # Node 宿主：块调度 + CLI
 ├── Scripts/translate.sh     # 离线翻译脚本
 ├── ios-bridge/
-│   ├── guest.js             # WKWebView 内宿主（syscall→Swift 桥）
+│   ├── guest.js             # WKWebView 内宿主（复用 createSyscalls + 注入 fs）
+│   ├── memfs.js             # 浏览器内存 fs 适配器（Swift 预注入文件）
 │   ├── WasmGuestBridge.swift# Swift 侧 WKWebView 桥接骨架
 │   └── assets/*.wasm        # 预翻译的测试模块
 ├── tests/
-│   ├── regression.js        # 指令级 + 端到端回归测试（25 断言）
-│   ├── minimal/verify/real_c/echo  # 端到端测试 ELF
+│   ├── regression.js        # 指令级 + 端到端回归测试（29 断言）
+│   ├── minimal/verify/real_c/echo/fileio/getdents  # 端到端测试 ELF
+│   ├── rootfs/              # 最小 rootfs（etc/version, etc/passwd, ...）
 │   └── asm/                 # 17 个指令级汇编测试（源码 + ELF + 期望值）
 └── README.md
 
@@ -153,8 +172,9 @@ wasm-jit/
 
 **Node 验证**：
 ```bash
-node run.js <aarch64-elf> [--trace] [--verbose] [--dump out.wasm]
-node tests/regression.js          # 全量回归（25 断言）
+node run.js <aarch64-elf> [--trace] [--verbose] [--rootfs DIR] [--dump out.wasm]
+node run.js tests/fileio --rootfs tests/rootfs   # 文件 syscall 端到端
+node tests/regression.js          # 全量回归（29 断言）
 ```
 
 **离线翻译**（产物打进 iOS App）：
@@ -163,9 +183,10 @@ bash Scripts/translate.sh <aarch64-elf> ios-bridge/assets/foo.wasm
 ```
 
 **iOS 集成**：
-1. 把 `guest.js` 和 `assets/*.wasm` 加入 App Bundle
-2. `WasmGuestBridge` 调用 `setup(guestJS:wasm:)`，再 `await run()`
-3. 实现 `GuestSyscallHandler` 处理文件/socket 等复杂 syscall
+1. 把 `src/syscalls.js`、`ios-bridge/memfs.js`、`ios-bridge/guest.js` 和 `assets/*.wasm` 加入 App Bundle
+2. Swift 从沙盒预置 rootfs 文件，`WasmGuestBridge` 调用 `setup(scripts:wasm:fsFiles:entryBlock:)`，再 `await run()`
+3. 文件 syscall 由注入的 `createMemFS(files)` 在 JS 内同步完成；退出后 `memfs.snapshot()` 可取回写入结果
+4. socket/网络等仍需 `GuestSyscallHandler` 经 `onSyscall` 桥到原生
 
 ---
 
@@ -205,5 +226,9 @@ bash Scripts/translate.sh <aarch64-elf> ios-bridge/assets/foo.wasm
 1. **真机验证**：在 iOS 设备跑 `guest.js`，确认 JSC 实际启用 OMG tier（而非 BBQ-only）
 2. **补齐 translator 搬进 JS**：加 Buffer/Uint8Array polyfill，让运行时可翻译新 ELF
 3. **扩展指令集**：NEON/FP（glibc 静态二进制大量使用）、原子操作
-4. **动态链接**：实现 ld.so 最小加载 + GOT/PLT 重定位
-5. **musl 优先**：静态 musl 二进制比 glibc 简单得多，更适合作为首个完整支持目标
+4. **更多 syscall**：`statx/faccessat/readlinkat/renameat/unlinkat/mkdirat`、终端 `ioctl(TCGETS)`、signal/futex
+5. **动态链接**：实现 ld.so 最小加载 + GOT/PLT 重定位
+6. **musl 优先**：静态 musl 二进制比 glibc 简单得多，更适合作为首个完整支持目标
+7. **跑通简单 coreutils**：用 musl 静态 `cat`/`ls`/`echo` 验证文件 syscall 覆盖是否够用
+
+**已完成（2026-11-27）**：文件系统 syscall + rootfs 沙箱 + iOS 内存 fs 注入链路（见第 3 节）。
