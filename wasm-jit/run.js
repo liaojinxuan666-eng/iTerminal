@@ -35,7 +35,9 @@ function run(elfPath, opts = {}) {
         env: {
             memory,
             syscall: (nr, a0, a1, a2, a3, a4, a5) => {
-                // WASM i64 参数是 BigInt，宿主 JS 侧统一转成 Number
+                // exit/exit_group 必须保留 BigInt 原始值（低 8 位不能被 2^53 转换污染）
+                if (nr === 93n || nr === 94n) return BigInt(sc.dispatch(nr, [a0]));
+                // 其余 syscall：WASM i64 参数转 Number（地址/长度均远小于 2^53）
                 const nums = [a0, a1, a2, a3, a4, a5].map(x => Number(x));
                 return BigInt(sc.dispatch(nr, nums));
             },

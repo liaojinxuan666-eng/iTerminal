@@ -78,7 +78,33 @@ $ node -e "run('tests/echo',{input:Buffer.from('HelloTerm!')})"
 
 **浏览器宿主**（`ios-bridge/guest.js`）也在 Node 模拟环境跑通同样结果，证明 Swift 桥接层吃的接口是好的。
 
+**指令级回归测试**：`tests/regression.js` 用 17 个手写汇编 ELF（退出码携带运算结果）+ 4 个端到端用例，覆盖上述全部新增指令与修复的 bug：
+```bash
+$ node tests/regression.js
+结果: 25 passed, 0 failed
+```
+
+### 指令集扩展（2026-11 引擎升级）
+最初翻译器只覆盖手写汇编 + 简单 C 的指令子集。用真实 `gcc -O0/-O2 -mgeneral-regs-only` 编译的复杂 C 程序做覆盖探针，补齐了编译器高频生成的指令：
+
+| 指令族 | 覆盖 |
+|---|---|
+| 逻辑寄存器 | AND/BIC/ORR/ORN/EOR/EON/ANDS/BICS + LSL/LSR/ASR/ROR 移位 |
+| 逻辑立即数 | ANDI/ORRI/EORI/ANDSI + 完整 `DecodeBitMasks` 位掩码解码 |
+| 位域 | SBFM/UBFM/BFM 及别名 sxtw/sbfx/ubfx/ubfiz/asr/lsl/lsr/bfi |
+| 变量移位 | LSLV/LSRV/ASRV/RORV |
+| 符号加载 | LDRSB/LDRSH/LDRSW |
+| 寄存器变址访存 | `ldr/str [Rn, Rm{, extend {amount}}]`（`-O0` 下 `arr[i]` 的典型形式）|
+| MOVE 宽立即数 | MOVZ/MOVK/MOVN 完整区分 + 32 位零扩展 |
+| 其它 | NOP（对齐填充）、ANDS/条件标志 |
+
+现在真实 gcc 编译的复杂 C 探针（数组/结构体/位运算/除法/switch/符号加载）**全部指令 0 未实现**。
+
 ### 调试中修掉的真实 bug（都是硬细节）
+- **MOVK 识别掩码错误**：原掩码 `0x1f800000` 把区分 MOVZ/MOVK 的 opc 位（bit30:29）清掉，导致所有 MOVK 被当成 MOVZ，`movk` 拼大常量失效 → 改用 `0x7f800000` 按 opc 区分（MOVZ=MOVW opc=2 / MOVK opc=3 / MOVN opc=0）
+- **CMP 破坏 SP**：ADD/SUB 立即数里 Rd=31 正常是 SP，但 CMP/CMN（setflags=1）时 Rd=31 是 ZR。原实现把 CMP 结果写进 SP，导致栈指针被污染、访存越界 → setflags 且 rd=31 时改为 `drop`
+- **i64→Number 精度丢失**：syscall 桥接把 WASM i64(BigInt) 转 Number（>2^53 丢精度），exit code 低位被污染，恒为 0 → exit 走 BigInt 域 `& 0xff`（run.js / guest.js 均已修）
+- **位域 opc 编码写反**：SBFM=opc0 / UBFM=opc2 / BFM=opc3，原代码把 SBFM 当 opc1，导致 sxtw/asr 走错分支 → 修正并改正符号扩展（逻辑右移+掩码再符号扩展）
 - JS 位运算返回有符号 32 位：`0xd4000001 & 0xff000000` 是负数，导致 svc 指令永远匹配不上 → 统一 `>>> 0`
 - WASM `if` 缺 block type 字节 `0x40`
 - import memory 的 limits flags 顺序
@@ -111,7 +137,10 @@ wasm-jit/
 │   ├── guest.js             # WKWebView 内宿主（syscall→Swift 桥）
 │   ├── WasmGuestBridge.swift# Swift 侧 WKWebView 桥接骨架
 │   └── assets/*.wasm        # 预翻译的测试模块
-├── tests/                   # 测试二进制
+├── tests/
+│   ├── regression.js        # 指令级 + 端到端回归测试（25 断言）
+│   ├── minimal/verify/real_c/echo  # 端到端测试 ELF
+│   └── asm/                 # 17 个指令级汇编测试（源码 + ELF + 期望值）
 └── README.md
 
 测试源码在相邻的 /workspace/linux-abi/tests/：
@@ -125,6 +154,7 @@ wasm-jit/
 **Node 验证**：
 ```bash
 node run.js <aarch64-elf> [--trace] [--verbose] [--dump out.wasm]
+node tests/regression.js          # 全量回归（25 断言）
 ```
 
 **离线翻译**（产物打进 iOS App）：

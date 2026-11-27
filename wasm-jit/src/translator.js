@@ -216,6 +216,33 @@ function emitCond(cond) {
     }
 }
 
+/* ==================== AArch64 逻辑立即数 bitmask 解码 ==================== */
+
+/** DecodeBitMasks: 把 N:immr:imms 解成操作宽度内的位掩码（BigInt） */
+function decodeBitmaskImm(sf, N, immr, imms) {
+    const bits = sf ? 64 : 32;
+    const immsBits = sf ? 6 : 5;
+    // len = MSB(immN : NOT(imms))
+    const combined = (N << immsBits) | ((~imms) & ((1 << immsBits) - 1));
+    if (combined === 0) return null;
+    let len = 0;
+    while ((combined >> (len + 1)) > 0) len++;
+    if (len < 1) return null;
+    const esize = 1 << len;
+    const levels = esize - 1;
+    if ((imms & levels) === levels) return null;
+    const S = imms & levels;
+    const R = immr & levels;
+    const welem = ONES(S + 1);
+    const esizeB = BigInt(esize), rB = BigInt(R);
+    let elem = ((welem >> rB) | (welem << (esizeB - rB))) & ONES(esize);
+    let result = 0n;
+    for (let off = 0; off < bits; off += esize) result |= elem << BigInt(off);
+    return result;
+}
+
+const ONES = n => n >= 64 ? 0xffffffffffffffffn : (1n << BigInt(n)) - 1n;
+
 /* ==================== 指令翻译 ==================== */
 
 function translateBlock(blocks, blockIdx, ctx) {
@@ -328,23 +355,34 @@ function translateInsn(w, pc, ctx) {
     const o = [];
     const rd = B(w, 4, 0), rn = B(w, 9, 5), rm = B(w, 20, 16);
 
-    // ---- MOVZ / MOVK / MOVN ----
-    if (((w & 0x1f800000) >>> 0) === 0x12800000 || ((w & 0x1f800000) >>> 0) === 0x13800000 || ((w & 0x1f800000) >>> 0) === 0x10800000) {
-        const hw = B(w, 22, 21) * 16;
-        const imm16 = B(w, 20, 5);
-        const isMovn = ((w & 0x1f800000) >>> 0) === 0x10800000;
-        const isMovk = ((w & 0x1f800000) >>> 0) === 0x13800000;
-        if (isMovk) {
-            // 保留高位，替换 16 位
-            o.push(...getReg(rd, false), OP.i64_const, ...sleb(~0xffffn << BigInt(hw) & 0xffffffffffffffffn), OP.i64_and);
-            o.push(OP.i64_const, ...sleb(BigInt(imm16) << BigInt(hw)), OP.i64_or);
-        } else {
-            let v = BigInt(imm16) << BigInt(hw);
-            if (isMovn) v = ~v;
-            o.push(OP.i64_const, ...sleb(v));
+    // ---- NOP / 常用 system hint（对齐填充）----
+    if (w === 0xd503201f || ((w & 0xfffff0ff) >>> 0) === 0xd503201f) return o;
+    if (((w & 0xfff0ffff) >>> 0) === 0xd503201f) return o;
+
+    // ---- MOVZ / MOVK / MOVN（move wide immediate）----
+    // 编码 sf opc 100000 hw(2) imm16 rd；opc: 00=MOVN, 10=MOVZ, 11=MOVK
+    // 掩码必须保留 bit[30:29](opc) 才能区分三者
+    {
+        const mw = (w & 0x7f800000) >>> 0;
+        if (mw === 0x52800000 || mw === 0x72800000 || mw === 0x12800000) {
+            const sf = (w >>> 31) & 1;
+            const hw = B(w, 22, 21) * 16;
+            const imm16 = B(w, 20, 5);
+            const isMovk = mw === 0x72800000;
+            const isMovn = mw === 0x12800000;
+            if (isMovk) {
+                const keepMask = (~(0xffffn << BigInt(hw))) & 0xffffffffffffffffn;
+                o.push(...getReg(rd, false), OP.i64_const, ...sleb(keepMask), OP.i64_and);
+                o.push(OP.i64_const, ...sleb(BigInt(imm16) << BigInt(hw)), OP.i64_or);
+            } else {
+                let v = BigInt(imm16) << BigInt(hw);
+                if (isMovn) v = ~v;
+                o.push(OP.i64_const, ...sleb(v));
+            }
+            if (!sf) o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u); // 32 位写零扩展
+            o.push(...setReg(rd, false));
+            return o;
         }
-        o.push(...setReg(rd, false));
-        return o;
     }
 
     // ---- ADR / ADRP ----
@@ -369,10 +407,13 @@ function translateInsn(w, pc, ctx) {
         o.push(...getReg(rn, useSP), OP.i64_const, ...sleb(imm));
         if (setFlags) {
             o.push(OP.call, ...uleb(ctx.setflagsIdx)); // 消费 a,b 返回 r 并设 flags
+            // CMP/CMN: Rd=31 表示 ZR（丢弃结果），绝不能写成 SP
+            if (rd === 31) o.push(OP.drop);
+            else o.push(...setReg(rd, false));
         } else {
             o.push(isSub ? OP.i64_sub : OP.i64_add);
+            o.push(...setReg(rd, rd === 31)); // ADD/SUB 立即数 Rd=31 是 SP
         }
-        o.push(...setReg(rd, rd === 31));
         return o;
     }
 
@@ -390,16 +431,171 @@ function translateInsn(w, pc, ctx) {
             else if (shiftType === 1) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shr_u);
             else if (shiftType === 2) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shr_s);
         }
-        if (setFlags) o.push(OP.call, ...uleb(ctx.setflagsIdx));
-        else o.push(isSub ? OP.i64_sub : OP.i64_add);
-        o.push(...setReg(rd, rd === 31));
+        if (setFlags) {
+            o.push(OP.call, ...uleb(ctx.setflagsIdx));
+            if (rd === 31) o.push(OP.drop); // CMP 寄存器: Rd=31 是 ZR
+            else o.push(...setReg(rd, false));
+        } else {
+            o.push(isSub ? OP.i64_sub : OP.i64_add);
+            o.push(...setReg(rd, false)); // 移位寄存器形式 r31=ZR，非 SP
+        }
         return o;
     }
 
-    // ---- 逻辑寄存器 ORR（mov 别名）----
-    if (((w & 0x7f000000) >>> 0) === 0x0a000000 || ((w & 0x7f000000) >>> 0) === 0x2a000000) {
-        o.push(...getReg(rn, false), ...getReg(rm, false));
-        o.push(((w & 0x7f000000) >>> 0) === 0x2a000000 ? OP.i64_or : OP.i64_and);
+    // ---- 逻辑（移位寄存器）：AND/BIC/ORR/ORN/EOR/EON/ANDS/BICS ----
+    // 编码 sf opc 01010 shift N rm imm6 rn rd，opc∈{00:AND/BIC,01:ORR/ORN,10:EOR/EON,11:ANDS/BICS}
+    // N=1 表示第二个操作数取反（BIC/ORN/EON/BICS）。含 mov 寄存器别名（orr Xd,XZR,Xm）。
+    {
+        const top = (w & 0x7f000000) >>> 0;
+        if (top === 0x0a000000 || top === 0x2a000000 || top === 0x4a000000 || top === 0x6a000000) {
+            const sf = (w >>> 31) & 1;
+            const opc = B(w, 30, 29);
+            const shiftType = B(w, 23, 22), imm6 = B(w, 15, 10);
+            const invert = (w >>> 21) & 1;
+            o.push(...getReg(rn, false), ...getReg(rm, false));
+            if (imm6) {
+                if (shiftType === 0) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shl);
+                else if (shiftType === 1) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shr_u);
+                else if (shiftType === 2) o.push(OP.i64_const, ...sleb(imm6), OP.i64_shr_s);
+                else o.push(OP.i64_const, ...sleb(imm6), OP.i64_rotr);
+            }
+            if (invert) o.push(OP.i64_const, ...sleb(-1n), OP.i64_xor); // ~rm
+            // opc: 0=AND 1=ORR 2=EOR 3=ANDS
+            if (opc === 0) o.push(OP.i64_and);
+            else if (opc === 1) o.push(OP.i64_or);
+            else if (opc === 2) o.push(OP.i64_xor);
+            else {
+                // ANDS/BICS：按结果设置 N/Z（C=V=0）
+                o.push(OP.i64_and);
+                // 结果已在栈顶，复制一份用于设标志
+                o.push(OP.global_set, ...uleb(G.SCRATCH), OP.global_get, ...uleb(G.SCRATCH));
+                o.push(OP.i32_const, ...sleb(0), OP.global_set, ...uleb(G.FLAGS));
+                o.push(OP.global_get, ...uleb(G.SCRATCH), OP.i64_eqz, OP.if, 0x40,
+                       OP.i32_const, ...sleb(2), OP.global_get, ...uleb(G.FLAGS), OP.i32_or,
+                       OP.global_set, ...uleb(G.FLAGS), OP.end);
+                o.push(OP.global_get, ...uleb(G.SCRATCH), OP.i64_const, ...sleb(63),
+                       OP.i64_shr_u, OP.i32_wrap_i64, OP.i32_const, ...sleb(1), OP.i32_and,
+                       OP.if, 0x40, OP.i32_const, ...sleb(1), OP.global_get, ...uleb(G.FLAGS),
+                       OP.i32_or, OP.global_set, ...uleb(G.FLAGS), OP.end);
+                o.push(OP.global_get, ...uleb(G.SCRATCH));
+            }
+            if (!sf) { // 32 位结果零扩展到 64 位
+                o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u);
+            }
+            o.push(...setReg(rd, false));
+            return o;
+        }
+    }
+
+    // ---- 逻辑（立即数）：ANDI/ORRI/EORI/ANDSI ----
+    // 编码 sf opc 100100 N immr(6) imms(6) rn rd
+    {
+        const top = (w & 0x7f800000) >>> 0;
+        if (top === 0x12000000 || top === 0x32000000 || top === 0x52000000 || top === 0x72000000) {
+            const sf = (w >>> 31) & 1;
+            const opc = B(w, 30, 29);
+            const N = B(w, 22, 22), immr = B(w, 21, 16), imms = B(w, 15, 10);
+            const mask = decodeBitmaskImm(sf, N, immr, imms);
+            if (mask === null) { o.push(OP.unreachable); return o; }
+            o.push(...getReg(rn, false), OP.i64_const, ...sleb(mask));
+            if (opc === 0) o.push(OP.i64_and);
+            else if (opc === 1) o.push(OP.i64_or);
+            else if (opc === 2) o.push(OP.i64_xor);
+            else {
+                // ANDS
+                o.push(OP.i64_and, OP.global_set, ...uleb(G.SCRATCH), OP.global_get, ...uleb(G.SCRATCH));
+                o.push(OP.i32_const, ...sleb(0), OP.global_set, ...uleb(G.FLAGS));
+                o.push(OP.global_get, ...uleb(G.SCRATCH), OP.i64_eqz, OP.if, 0x40,
+                       OP.i32_const, ...sleb(2), OP.global_get, ...uleb(G.FLAGS), OP.i32_or,
+                       OP.global_set, ...uleb(G.FLAGS), OP.end);
+                o.push(OP.global_get, ...uleb(G.SCRATCH), OP.i64_const, ...sleb(63),
+                       OP.i64_shr_u, OP.i32_wrap_i64, OP.i32_const, ...sleb(1), OP.i32_and,
+                       OP.if, 0x40, OP.i32_const, ...sleb(1), OP.global_get, ...uleb(G.FLAGS),
+                       OP.i32_or, OP.global_set, ...uleb(G.FLAGS), OP.end);
+                o.push(OP.global_get, ...uleb(G.SCRATCH));
+            }
+            if (!sf) o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u);
+            o.push(...setReg(rd, false));
+            return o;
+        }
+    }
+
+    // ---- 位域 UBFM/SBFM/BFM（含 lsl/lsr/asr/ubfx/ubfiz/sbfx/bfi 别名）----
+    // 编码 sf opc 100110 N immr(6) imms(6) rn rd，opc∈{00:SBFM,10:UBFM,11:BFM}
+    {
+        const top = (w & 0x7f800000) >>> 0;
+        if (top === 0x13000000 || top === 0x33000000 || top === 0x53000000 || top === 0x73000000) {
+            const sf = (w >>> 31) & 1;
+            const opc = B(w, 30, 29);
+            const immr = B(w, 21, 16), imms = B(w, 15, 10);
+            const bits = sf ? 64 : 32;
+            // 生成对 rn 的位域变换：结果放栈顶（i64）
+            const emitBitfield = () => {
+                o.push(...getReg(rn, false));
+                if (opc === 0) {
+                    // SBFM(opc=00): 抽取后符号扩展（sxtw/sbfx/asr 别名）
+                    if (imms >= immr) {
+                        const width = imms - immr + 1;
+                        // 先逻辑右移 + 掩码取出 width 位，再符号扩展
+                        if (immr) o.push(OP.i64_const, ...sleb(immr), OP.i64_shr_u);
+                        if (width < 64) o.push(OP.i64_const, ...sleb(ONES(width)), OP.i64_and);
+                        if (width < bits) {
+                            o.push(OP.i64_const, ...sleb(width), OP.i64_shl,
+                                   OP.i64_const, ...sleb(width), OP.i64_shr_s);
+                        }
+                    } else {
+                        // SBFIZ: (x & ONES(imms+1)) 左移后按最高有效位符号扩展
+                        const width = imms + 1;
+                        const shift = bits - immr;
+                        o.push(OP.i64_const, ...sleb(ONES(width)), OP.i64_and,
+                               OP.i64_const, ...sleb(shift), OP.i64_shl);
+                        const top = width + shift;
+                        if (top < 64) o.push(OP.i64_const, ...sleb(top), OP.i64_shl,
+                                             OP.i64_const, ...sleb(top), OP.i64_shr_s);
+                    }
+                } else if (opc === 2) {
+                    // UBFM(opc=10): wmask = ROR(ONES(imms+1), immr, bits) 后右移
+                    // 等价：(x >> immr) & ONES(imms-immr+1)  当 imms>=immr
+                    if (imms >= immr) {
+                        const width = imms - immr + 1;
+                        const mask = ONES(width) & (sf ? 0xffffffffffffffffn : 0xffffffffn);
+                        if (immr) o.push(OP.i64_const, ...sleb(immr), OP.i64_shr_u);
+                        o.push(OP.i64_const, ...sleb(mask), OP.i64_and);
+                    } else {
+                        // UBFIZ: (x & ONES(imms+1)) << (bits-immr)
+                        const mask = ONES(imms + 1);
+                        o.push(OP.i64_const, ...sleb(mask), OP.i64_and,
+                               OP.i64_const, ...sleb(bits - immr), OP.i64_shl);
+                    }
+                } else {
+                    // BFM(opc=11) / 保留(opc=01)：简化为位域插入（较少见，保留近似语义）
+                    const width = imms >= immr ? imms - immr + 1 : imms + 1;
+                    const mask = ONES(width);
+                    o.push(OP.i64_const, ...sleb(mask), OP.i64_and);
+                }
+                if (!sf) o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u);
+            };
+            emitBitfield();
+            o.push(...setReg(rd, false));
+            return o;
+        }
+    }
+
+    // ---- 变量移位 LSLV/LSRV/ASRV/RORV ----
+    // 编码 sf 0 0 11010110 rm opcode(6) rn rd；opcode 8/9/10/11
+    // 高 11 位固定为 sf:11010110:0，清掉 sf 后基准 = 0x1ac00000
+    if (((w & 0x7fe00000) >>> 0) === 0x1ac00000 && B(w, 15, 10) >= 8) {
+        const sf = (w >>> 31) & 1;
+        const rm2 = B(w, 20, 16), opcode = B(w, 15, 10);
+        const shiftMask = sf ? 63 : 31;
+        o.push(...getReg(rn, false), ...getReg(rm2, false),
+               OP.i64_const, ...sleb(shiftMask), OP.i64_and);
+        if (opcode === 8) o.push(OP.i64_shl);
+        else if (opcode === 9) o.push(OP.i64_shr_u);
+        else if (opcode === 10) o.push(OP.i64_shr_s);
+        else if (opcode === 11) o.push(OP.i64_rotr);
+        else { o.push(OP.unreachable); return o; }
+        if (!sf) o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u);
         o.push(...setReg(rd, false));
         return o;
     }
@@ -453,12 +649,57 @@ function translateInsn(w, pc, ctx) {
         return o;
     }
 
+    // ---- LDR/STR 寄存器变址 [Rn, Rm{, extend {amount}}] ----
+    // 编码 size 111000 opc Rm option(3) S 00 Rn Rt，option: 2=UXTW 3=LSL/UXTX 6=SXTW 7=SXTX
+    // S=1 表示按访问宽度缩放。这是 -O0 编译器生成 arr[i] 的典型形式。
+    if (((w & 0x3b200c00) >>> 0) === 0x38200800) {
+        const size = B(w, 31, 30);
+        const opc = B(w, 23, 22);
+        const rmOff = B(w, 20, 16), option = B(w, 15, 13), S = B(w, 12, 12);
+        const sf = (w >>> 31) & 1;
+        const isLoad = opc === 1 || opc === 2;
+        const isSignedLoad = opc === 2;
+        // base → SCRATCH
+        o.push(...getReg(rn, true), OP.global_set, ...uleb(G.SCRATCH));
+        // offset：按 option 扩展
+        o.push(...getReg(rmOff, false));
+        if (option === 6) { // SXTW
+            o.push(OP.i32_wrap_i64, OP.i64_extend_i32_s);
+        } else if (option === 2) { // UXTW
+            o.push(OP.i32_wrap_i64, OP.i64_extend_i32_u);
+        } else if (option === 0 || option === 4) { // UXTB / SXTB
+            o.push(OP.i64_const, ...sleb(0xff), OP.i64_and);
+            if (option === 4) o.push(OP.i64_const, ...sleb(56), OP.i64_shl, OP.i64_const, ...sleb(56), OP.i64_shr_s);
+        } else if (option === 1 || option === 5) { // UXTH / SXTH
+            o.push(OP.i64_const, ...sleb(0xffff), OP.i64_and);
+            if (option === 5) o.push(OP.i64_const, ...sleb(48), OP.i64_shl, OP.i64_const, ...sleb(48), OP.i64_shr_s);
+        }
+        // option===3 (LSL/UXTX)：无需扩展
+        if (S) o.push(OP.i64_const, ...sleb(size), OP.i64_shl);
+        o.push(OP.global_get, ...uleb(G.SCRATCH), OP.i64_add, OP.i32_wrap_i64);
+        if (isLoad) {
+            const loadOp = isSignedLoad
+                ? (size === 2 ? OP.i64_load32_s : size === 1 ? OP.i64_load16_s : OP.i64_load8_s)
+                : (size === 3 ? OP.i64_load : size === 2 ? OP.i64_load32_u
+                   : size === 1 ? OP.i64_load16_u : OP.i64_load8_u);
+            o.push(loadOp, size, 0, ...setReg(rd, false));
+        } else {
+            o.push(...getReg(rd, false));
+            const storeOp = size === 3 ? OP.i64_store : size === 2 ? OP.i64_store32
+                          : size === 1 ? OP.i64_store16 : OP.i64_store8;
+            o.push(storeOp, size, 0);
+        }
+        return o;
+    }
+
     // ---- LDR/STR 立即数（unsigned offset / unscaled / pre-index / post-index）----
     // 用 SCRATCH 保存 base，避免 WASM 栈无法复制的问题。
     // 策略：base→SCRATCH；若写回则单独重算 Rn=base+imm；再用 SCRATCH 重算 EA 做访存。
     if (((w & 0x3b000000) >>> 0) === 0x39000000 || ((w & 0x3b000000) >>> 0) === 0x38000000) {
         const size = B(w, 31, 30);          // 0=byte 1=half 2=word 3=dword
-        const isLoad = ((w >> 22) & 1) === 1;
+        const opc = B(w, 23, 22);           // 00=store 01=load 10=signed load 11=NEON
+        const isLoad = opc === 1 || opc === 2;
+        const isSignedLoad = opc === 2;     // LDRSB/LDRSH/LDRSW
         const isUnscaled = ((w & 0x3b000000) >>> 0) === 0x38000000;
         const addrMode = B(w, 11, 10);      // 00=unscaled offset, 01=post-index, 11=pre-index
         let imm = isUnscaled ? SEXT(B(w, 20, 12), 9) : B(w, 21, 10) * (1 << size);
@@ -478,8 +719,10 @@ function translateInsn(w, pc, ctx) {
         o.push(OP.i32_wrap_i64);
 
         if (isLoad) {
-            const op = size === 3 ? OP.i64_load : size === 2 ? OP.i64_load32_u
-                     : size === 1 ? OP.i64_load16_u : OP.i64_load8_u;
+            const op = isSignedLoad
+                ? (size === 2 ? OP.i64_load32_s : size === 1 ? OP.i64_load16_s : OP.i64_load8_s)
+                : (size === 3 ? OP.i64_load : size === 2 ? OP.i64_load32_u
+                   : size === 1 ? OP.i64_load16_u : OP.i64_load8_u);
             o.push(op, size, 0, ...setReg(rd, false));
         } else {
             o.push(...getReg(rd, false));
@@ -530,6 +773,7 @@ function translateInsn(w, pc, ctx) {
     }
 
     // ---- 未实现：返回 trap 标记（宿主可观测）----
+    if (ctx && ctx.unimpl) ctx.unimpl.push({ pc, word: (w >>> 0).toString(16).padStart(8, '0') });
     o.push(OP.unreachable);
     return o;
 }
@@ -588,7 +832,7 @@ function translateELF(pathOrBuffer, opts = {}) {
     m.code(sfBody, [{ count: 1, type: VT.i64 }]);
 
     // 每个块一个函数 () -> i32
-    const ctx = { syscallIdx, setflagsIdx, bias: elf.bias };
+    const ctx = { syscallIdx, setflagsIdx, bias: elf.bias, unimpl: opts.unimpl || null };
     const blockFuncIdx = [];
     const blockBodies = [];
     for (let i = 0; i < blocks.leaders.length; i++) {

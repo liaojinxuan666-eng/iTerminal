@@ -14,6 +14,8 @@
 function uleb(v) {
     let n = BigInt(v);
     if (n < 0n) throw new Error('uleb: negative value');
+    // 归一化到无符号 64 位：避免调用方传入 >2^64 的掩码时编码出非法长 varint
+    n &= 0xffffffffffffffffn;
     const out = [];
     do {
         let byte = Number(n & 0x7fn);
@@ -27,6 +29,10 @@ function uleb(v) {
 /** 有符号 LEB128，接受 number 或 bigint */
 function sleb(v) {
     let n = BigInt(v);
+    // 归一化到有符号 64 位：WASM i64.const 必须是 64 位有符号 LEB128。
+    // 调用方常产生 0xffffffffffff.... 这类无符号位掩码，不归一化会编出 10 字节非法 varint。
+    n &= 0xffffffffffffffffn;
+    if (n >= (1n << 63n)) n -= (1n << 64n);
     const out = [];
     for (;;) {
         let byte = Number(n & 0x7fn);

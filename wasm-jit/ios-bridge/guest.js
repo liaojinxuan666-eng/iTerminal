@@ -34,9 +34,17 @@
             const imports = {
                 env: {
                     memory: this.memory,
-                    syscall: (nr, a0, a1, a2, a3, a4, a5) => this._syscall(
-                        Number(nr), Number(a0), Number(a1), Number(a2),
-                        Number(a3), Number(a4), Number(a5)),
+                    syscall: (nr, a0, a1, a2, a3, a4, a5) => {
+                        // exit code 是 i64 低位，必须在 BigInt 域取 &0xff，否则 Number() 会丢精度
+                        if (nr === 93n || nr === 94n) {
+                            this.exitCode = Number(a0 & 0xffn);
+                            if (this.onSyscall) this.onSyscall('exit', { code: this.exitCode });
+                            return 0n;
+                        }
+                        return this._syscall(
+                            Number(nr), Number(a0), Number(a1), Number(a2),
+                            Number(a3), Number(a4), Number(a5));
+                    },
                 },
             };
             const mod = await WebAssembly.compile(this.wasmBytes);

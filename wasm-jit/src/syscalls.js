@@ -58,8 +58,10 @@ function createSyscalls(env) {
         },
 
         // ---- 进程生命周期 ----
-        93: code => { env.onExit?.(Number(code) & 0xff); return 0; },   // exit
-        94: code => { env.onExit?.(Number(code) & 0xff); return 0; },   // exit_group
+        // code 可能是 BigInt（WASM i64 原始值），必须先按 BigInt 取低 8 位再转 Number。
+        // 若先 Number() 会因 >2^53 丢精度，低字节被污染（曾导致 exit code 恒为 0）。
+        93: code => { env.onExit?.(Number(BigInt(code) & 0xffn)); return 0; },   // exit
+        94: code => { env.onExit?.(Number(BigInt(code) & 0xffn)); return 0; },   // exit_group
 
         // ---- 进程信息 ----
         172: () => 4242,                 // getpid

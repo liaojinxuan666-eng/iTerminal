@@ -1,0 +1,8 @@
+ubfiz 0
+lslv 0
+lsrv 247
+asrv 247
+asr_imm 247
+sbfx 27
+orn 255
+eon 255

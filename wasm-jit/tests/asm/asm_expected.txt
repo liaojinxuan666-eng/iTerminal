@@ -1,0 +1,8 @@
+movz 240
+eorlsl 112
+eorlsr 7
+andi 0
+andi32 240
+ubfx 27
+lsl_imm 128
+bic 15
