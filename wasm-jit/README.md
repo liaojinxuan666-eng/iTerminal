@@ -1,0 +1,157 @@
+# wasm-jit — 借 WebKit 的 JIT 在 iOS 上跑 Linux 二进制
+
+> 核心思路：iOS App 拿不到 JIT entitlement，但 WKWebView 里的 JavaScriptCore 有系统签名的 JIT 能力。
+> 把 AArch64 Linux 二进制**翻译成 WebAssembly**，交给 WebKit JIT 执行——App 自己一行机器码都不生成。
+
+这是一个**可验证的原型**：翻译器和 syscall 桥接全部从零实现，未修改的 aarch64 Linux ELF 已在 Node（同为 WASM JIT 宿主）上真实跑通。
+
+---
+
+## 1. 为什么走这条路
+
+上一版 `linux-abi` 是纯解释执行——能跑，但没有 JIT，性能注定上不去。iOS 上直接 JIT 的障碍：
+
+| 障碍 | 说明 |
+|---|---|
+| `W^X` / `dynamic-codesigning` | 普通 App 无法 `mmap` 可执行内存，拿不到 JIT entitlement |
+| 苹果审核 | 动态生成机器码是 3.3.2 红线 |
+| proot/ptrace | iOS 的 ptrace 不支持完整 syscall trace，走不通 |
+
+**借壳方案**：把 guest 代码编译成 WASM，让 WebKit 的 JSC 做 JIT。App 只是加载字节码 + 收发消息，不碰机器码。
+
+> 事实依据：iOS 14.5 起 WKWebView 在第三方 App 内可启用 JIT（BBQ 基线编译器 + OMG 优化编译器）；WASM 通过 JSC 编译执行。见 [WebKit/Safari WASM 安全分析](https://www.systemshardening.com/articles/wasm/wasm-webkit-mobile-security)。
+
+---
+
+## 2. 架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Swift App (宿主，无 JIT entitlement)                    │
+│    WasmGuestBridge ──WKScriptMessageHandler──┐           │
+└──────────────────────────────────────────────┼───────────┘
+                                              │ syscall 消息
+┌──────────────────────────────────────────────▼───────────┐
+│  WKWebView WebContent 进程 (系统签名，持有 JIT)           │
+│    guest.js ──WASM import──> JIT 编译后的 guest 代码      │
+│                              (bb0..bbN 基本块函数)        │
+└─────────────────────────────────────────────────────────┘
+
+离线（构建时）：
+  AArch64 ELF ──translator.js──> .wasm 模块 ──> 打进 App Bundle
+```
+
+**关键设计**：
+- **翻译离线化**：ELF→WASM 在构建时完成，iOS 端只加载 `.wasm`。避免把 Buffer/fs 依赖搬进浏览器。
+- **基本块 = WASM 函数**：每个块返回下一个块号，JS 只做调度。JIT 编译的是真正的 guest 指令翻译结果。
+- **寄存器 = mutable global**：x0..x30、SP、NZCV 标志、返回地址都是 i64/i32 global。
+- **地址重映射**：guest 64 位地址静态减去 `bias`（最小 PT_LOAD vaddr），映射到 WASM 32 位线性内存偏移。这是绕不开的折衷（见边界）。
+- **syscall = WASM import**：JS 侧实现 write/exit/uname 等；复杂 syscall（文件/socket）通过 `WKScriptMessageHandler` 桥到 Swift。
+
+---
+
+## 3. 已验证结果
+
+用标准 `aarch64-linux-gnu-gcc` 交叉编译的**未修改静态 ELF**，经翻译后在 WASM JIT 中真实执行：
+
+```
+$ node run.js /workspace/linux-abi/tests/minimal
+Hello from pure AArch64 Linux binary!
+[wasm-jit] guest 退出码=55        ← 1+2+...+10 正确
+
+$ node run.js /workspace/linux-abi/tests/verify
+test: mul/div/call/uname/write...
+PASS: all AArch64 ops verified!
+[wasm-jit] guest 退出码=12        ← 5! = 120 正确
+```
+
+`verify` 覆盖：**MADD、UDIV、SUBS/CMP、B.cond、BL/RET 函数调用、uname/write/exit syscall、退出码传递**。
+
+**浏览器宿主**（`ios-bridge/guest.js`）也在 Node 模拟环境跑通同样结果，证明 Swift 桥接层吃的接口是好的。
+
+### 调试中修掉的真实 bug（都是硬细节）
+- JS 位运算返回有符号 32 位：`0xd4000001 & 0xff000000` 是负数，导致 svc 指令永远匹配不上 → 统一 `>>> 0`
+- WASM `if` 缺 block type 字节 `0x40`
+- import memory 的 limits flags 顺序
+- 条件标志未归一化：`FLAGS & 4 = 4`，`C && !Z` 变成 `4 & 1 = 0` → 用 `(FLAGS >> n) & 1`
+- 函数索引：import 函数返回的索引算错，syscall 调到了 setflags
+- WASM i64 参数是 BigInt，`Buffer.from(buf, bigint)` 拿不到数据 → JS 侧转 Number
+- 块发现用了未算绝对地址的 classify，把目标 `0x4000f0` 算成 `0x0`
+- exit syscall 后的字符串被当指令解码 → 常量追踪 x8 识别 exit 并停扫
+
+---
+
+## 4. 文件结构
+
+```
+wasm-jit/
+├── src/
+│   ├── wasm-encoder.js      # 手写 WASM 二进制编码器（无第三方依赖）
+│   └── translator.js        # ELF 解析 + 基本块发现 + AArch64→WASM 翻译
+├── run.js                   # Node 宿主：syscall 实现 + 块调度 + CLI
+├── Scripts/translate.sh     # 离线翻译脚本
+├── ios-bridge/
+│   ├── guest.js             # WKWebView 内宿主（syscall→Swift 桥）
+│   ├── WasmGuestBridge.swift# Swift 侧 WKWebView 桥接骨架
+│   └── assets/*.wasm        # 预翻译的测试模块
+├── tests/                   # 从 linux-abi 复制的测试二进制
+└── README.md
+```
+
+## 5. 用法
+
+**Node 验证**：
+```bash
+node run.js <aarch64-elf> [--trace] [--verbose] [--dump out.wasm]
+```
+
+**离线翻译**（产物打进 iOS App）：
+```bash
+bash Scripts/translate.sh <aarch64-elf> ios-bridge/assets/foo.wasm
+```
+
+**iOS 集成**：
+1. 把 `guest.js` 和 `assets/*.wasm` 加入 App Bundle
+2. `WasmGuestBridge` 调用 `setup(guestJS:wasm:)`，再 `await run()`
+3. 实现 `GuestSyscallHandler` 处理文件/socket 等复杂 syscall
+
+---
+
+## 6. 边界与风险（诚实说明）
+
+### 技术边界
+| 限制 | 说明 |
+|---|---|
+| **32 位线性内存** | WASM 地址空间上限 4GB，iOS Safari 实测常低于 1.5GB，低端 WebContent 进程仅 150–300MB。64 位 guest 地址被静态压缩，无法支持真实 Linux 的完整地址布局 |
+| **静态 ELF only** | 尚未实现动态链接（ld.so、GOT/PLT 重定位） |
+| **指令子集** | 覆盖测试所需的整数/分支/访存/SVC；SIMD/NEON/FP、原子、异常未实现 |
+| **signal/线程/futex** | 未实现，guest 目前是单线程顺序执行 |
+| **syscall 覆盖** | Node 宿主实现了 write/exit/uname/getpid 等；Swift 侧需按应用需求补齐 |
+| **offline 翻译** | 翻译在构建时做，运行时不能加载任意新 ELF（除非把 translator 搬进 JS，需 polyfill Buffer/fs） |
+
+### iOS 特定风险
+- **JIT 可用性**：WKWebView 的 JIT 由系统进程持有，但**不同 iOS 版本/配置行为有差异**（BBQ-only vs OMG）。低端设备或特定配置可能降级为 BBQ-only（慢但不禁用）。需在目标真机上验证。
+- **Lockdown Mode**：启用后会禁用 WASM。必须有 JS 解释器降级路径（性能下降 3–5 倍）。
+- **内存压力**：WASM 线性内存 + JS 堆 + 编译后代码共享 WebContent 进程配额，超限会被 jetsam 杀掉。
+- **App Store 审核**：WASM 本身是网页标准，不算"动态执行未签名代码"；但**运行时从网络下载 wasm 并执行**可能触发 3.3.2。建议 wasm 随 App 内置、只做本地翻译产物。
+- **后台执行**：WKWebView 在后台会暂停，长时任务需 `beginBackgroundTask` 或移到底层（但那样又失去 WKWebView 的 JIT）。
+
+---
+
+## 7. 与相邻项目的关系
+
+- `/workspace/linux-abi/`：从零实现的解释器版（无 JIT），验证 ABI 兼容本身
+- `/workspace/ios-linux-terminal/`：终端 UI + ish-arm64 集成的产品骨架
+- **本项目**：exploration——验证"借 WebKit JIT"这条路是否真的可行
+
+三者是递进关系：ABI 引擎 → JIT 加速引擎 → 产品壳。本项目证明了 JIT 借壳在技术上跑得通，剩下的是工程量（补指令、补 syscall、补动态链接、真机验证）。
+
+---
+
+## 8. 下一步
+
+1. **真机验证**：在 iOS 设备跑 `guest.js`，确认 JSC 实际启用 OMG tier（而非 BBQ-only）
+2. **补齐 translator 搬进 JS**：加 Buffer/Uint8Array polyfill，让运行时可翻译新 ELF
+3. **扩展指令集**：NEON/FP（glibc 静态二进制大量使用）、原子操作
+4. **动态链接**：实现 ld.so 最小加载 + GOT/PLT 重定位
+5. **musl 优先**：静态 musl 二进制比 glibc 简单得多，更适合作为首个完整支持目标
