@@ -1,0 +1,75 @@
+name: Build & Test iTerminal (iOS)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-wasm-jit:
+    name: Test wasm-jit Runtime (Node.js)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run wasm-jit end-to-end & benchmark suite
+        run: node wasm-jit/tests/test_suite.js
+
+  build-ios-ipa:
+    name: Build Unsigned iOS IPA (XcodeGen + xcodebuild)
+    needs: test-wasm-jit
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bundle wasm-jit JS runtime into ios-app Resources
+        run: |
+          mkdir -p ios-app/Resources/runtime
+          cp wasm-jit/src/*.js ios-app/Resources/runtime/
+          cp wasm-jit/runtime/guest-v2.js ios-app/Resources/runtime/
+          ls -lh ios-app/Resources/runtime/
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios-app
+        run: xcodegen generate
+
+      - name: Build unsigned iOS app (iphoneos Release)
+        run: |
+          xcodebuild \
+            -project ios-app/iTerminal.xcodeproj \
+            -scheme iTerminal \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned .ipa
+        run: |
+          mkdir -p dist/Payload
+          cp -R build/Build/Products/Release-iphoneos/iTerminal.app dist/Payload/
+          cd dist
+          zip -r -q iTerminal-unsigned.ipa Payload
+          ls -lh iTerminal-unsigned.ipa
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iTerminal-unsigned-ipa
+          path: dist/iTerminal-unsigned.ipa
+          retention-days: 14
