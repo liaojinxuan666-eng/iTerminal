@@ -1495,7 +1495,7 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
     }
 
     // 42. SIMD INS Vd.<B/H/S/D>[idx], Rn
-    if (((insn & 0xbfe0fc00) >>> 0) === 0x4e001c00) {
+    if (((insn & 0xffe0fc00) >>> 0) === 0x4e001c00) {
       const imm5 = (insn >>> 16) & 0x1f;
       const rn = (insn >>> 5) & 0x1f;
       const vd = insn & 0x1f;
@@ -1511,6 +1511,54 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       else if (width === 2) c.op(OP.I64_STORE16, 1, 0);
       else if (width === 4) c.op(OP.I64_STORE32, 2, 0);
       else c.storeI64(0, 3);
+      pc = nextPC;
+      continue;
+    }
+
+    // 42b. SIMD DUP Vd.<T>, Vn.<T>[idx] (0x0E000400 / 0x4E000400)
+    if (((insn & 0xbfe0fc00) >>> 0) === 0x0e000400) {
+      const isQ = (insn >>> 30) === 1;
+      const imm5 = (insn >>> 16) & 0x1f;
+      const rn = (insn >>> 5) & 0x1f;
+      const vd = insn & 0x1f;
+      if ((imm5 & 1) === 1) {
+        c.i32Const(OFF_Q(rn) + (imm5 >>> 1)); c.op(OP.I64_LOAD8_U, 0, 0);
+        c.i64Const(0x0101010101010101n); c.op(OP.I64_MUL);
+      } else if ((imm5 & 3) === 2) {
+        c.i32Const(OFF_Q(rn) + (imm5 >>> 2) * 2); c.op(OP.I64_LOAD16_U, 1, 0);
+        c.i64Const(0x0001000100010001n); c.op(OP.I64_MUL);
+      } else if ((imm5 & 7) === 4) {
+        c.i32Const(OFF_Q(rn) + (imm5 >>> 3) * 4); c.op(OP.I64_LOAD32_U, 2, 0);
+        c.i64Const(0x0000000100000001n); c.op(OP.I64_MUL);
+      } else {
+        c.i32Const(OFF_Q(rn) + (imm5 >>> 4) * 8); c.loadI64(0, 3);
+      }
+      c.localSet(0);
+      c.i32Const(OFF_Q(vd)); c.localGet(0); c.storeI64(0, 3);
+      c.i32Const(OFF_Q(vd) + 8);
+      if (isQ) c.localGet(0); else c.i64Const(0n);
+      c.storeI64(0, 3);
+      pc = nextPC;
+      continue;
+    }
+
+    // 42c. SIMD INS Vd.<T>[dstIdx], Vn.<T>[srcIdx] (0x6E000400)
+    if (((insn & 0xffe08400) >>> 0) === 0x6e000400) {
+      const imm5 = (insn >>> 16) & 0x1f;
+      const imm4 = (insn >>> 11) & 0xf;
+      const rn = (insn >>> 5) & 0x1f;
+      const vd = insn & 0x1f;
+      let width = 8, dstOff = 0, srcOff = 0;
+      if ((imm5 & 1) === 1) { width = 1; dstOff = imm5 >>> 1; srcOff = imm4; }
+      else if ((imm5 & 3) === 2) { width = 2; dstOff = (imm5 >>> 2) * 2; srcOff = (imm4 >>> 1) * 2; }
+      else if ((imm5 & 7) === 4) { width = 4; dstOff = (imm5 >>> 3) * 4; srcOff = (imm4 >>> 2) * 4; }
+      else { width = 8; dstOff = (imm5 >>> 4) * 8; srcOff = (imm4 >>> 3) * 8; }
+      c.i32Const(OFF_Q(vd) + dstOff);
+      c.i32Const(OFF_Q(rn) + srcOff);
+      if (width === 1) { c.op(OP.I64_LOAD8_U, 0, 0); c.op(OP.I64_STORE8, 0, 0); }
+      else if (width === 2) { c.op(OP.I64_LOAD16_U, 1, 0); c.op(OP.I64_STORE16, 1, 0); }
+      else if (width === 4) { c.op(OP.I64_LOAD32_U, 2, 0); c.op(OP.I64_STORE32, 2, 0); }
+      else { c.loadI64(0, 3); c.storeI64(0, 3); }
       pc = nextPC;
       continue;
     }
