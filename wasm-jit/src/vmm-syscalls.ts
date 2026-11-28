@@ -552,7 +552,16 @@ export class GuestKernel {
           proc.state = 'blocked';
           if (proc.pendingPromise) blockedPromises.push(proc.pendingPromise);
         } else if (status === STATUS.FAULT) {
-          throw new Error(`Guest fault in pid=${proc.pid}: ${formatFaultDiagnostic(proc.cpu)}`);
+          const msg = `Guest fault in pid=${proc.pid}: ${formatFaultDiagnostic(proc.cpu)}`;
+          if (proc.ppid > 0) {
+            this.host.onStderr(UTF8_ENC.encode(`\n[iTerminal] ${msg}\n`));
+            proc.termSignal = 4; // SIGILL
+            proc.exitCode = 132;
+            proc.state = 'exited';
+            this._onProcessExit(proc);
+          } else {
+            throw new Error(msg);
+          }
         }
       }
 

@@ -1015,6 +1015,51 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       continue;
     }
 
+    // 26b. SMULH (0x9B407C00) — signed 64x64->128 high half (GCC signed division e.g. ls -al localtime!)
+    if (((insn & 0xffe0fc00) >>> 0) === 0x9b407c00) {
+      const rm = (insn >>> 16) & 0x1f;
+      const rn = (insn >>> 5) & 0x1f;
+      const rd = insn & 0x1f;
+      if (c.beginSetReg(rd, false)) {
+        c.getReg(rn, false, false); c.localSet(0);
+        c.getReg(rm, false, false); c.localSet(1);
+
+        c.localGet(0); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+        c.localGet(1); c.i64Const(32n); c.op(OP.I64_SHR_U);
+        c.op(OP.I64_MUL); c.localSet(2);
+
+        c.localGet(0); c.i64Const(32n); c.op(OP.I64_SHR_U);
+        c.localGet(1); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+        c.op(OP.I64_MUL); c.localSet(4);
+
+        c.localGet(0); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+        c.localGet(1); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+        c.op(OP.I64_MUL); c.i64Const(32n); c.op(OP.I64_SHR_U);
+        c.localGet(2); c.i64Const(0xffffffffn); c.op(OP.I64_AND); c.op(OP.I64_ADD);
+        c.localGet(4); c.i64Const(0xffffffffn); c.op(OP.I64_AND); c.op(OP.I64_ADD);
+        c.localSet(5);
+
+        // unsigned hi
+        c.localGet(0); c.i64Const(32n); c.op(OP.I64_SHR_U);
+        c.localGet(1); c.i64Const(32n); c.op(OP.I64_SHR_U);
+        c.op(OP.I64_MUL);
+        c.localGet(2); c.i64Const(32n); c.op(OP.I64_SHR_U); c.op(OP.I64_ADD);
+        c.localGet(4); c.i64Const(32n); c.op(OP.I64_SHR_U); c.op(OP.I64_ADD);
+        c.localGet(5); c.i64Const(32n); c.op(OP.I64_SHR_U); c.op(OP.I64_ADD);
+
+        // subtract b if a <s 0: (a >>s 63) & b
+        c.localGet(0); c.i64Const(63n); c.op(OP.I64_SHR_S);
+        c.localGet(1); c.op(OP.I64_AND, OP.I64_SUB);
+        // subtract a if b <s 0: (b >>s 63) & a
+        c.localGet(1); c.i64Const(63n); c.op(OP.I64_SHR_S);
+        c.localGet(0); c.op(OP.I64_AND, OP.I64_SUB);
+
+        c.endSetReg(rd, false, false);
+      }
+      pc = nextPC;
+      continue;
+    }
+
     // 27. Data-processing (1-source): RBIT (0), REV16 (1), REV32 (2), REV64 (3), CLZ (4), CLS (5)
     if (((insn & 0x5fe00000) >>> 0) === 0x5ac00000) {
       const is64 = (insn >>> 31) === 1;

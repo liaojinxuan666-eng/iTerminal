@@ -1298,6 +1298,28 @@ async function testWait4EchildAndGetgroups() {
   console.log(`[PASS] Test 29 (wait4 ECHILD + getgroups): wait4=-10 (ECHILD), getgroups=1`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 30: Real-Device BusyBox ls -al SMULH (0x9b407c40)
+// ---------------------------------------------------------------------------
+async function testSmulh() {
+  const code = [
+    // a = -1000, b = 0x4000_0000_0000_0000 (2^62) -> smulh = -250
+    A64.movn(2, 999),           // x2 = -1000
+    A64.movz(0, 0x4000, 3),     // x0 = 1 << 62
+    0x9b407c40,                 // exact iPhone opcode: smulh x0, x2, x0
+    A64.movReg(19, 0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(BigInt.asIntN(64, proc.cpu.getReg(19)), -250n, 'SMULH (-1000 * 2^62 >> 64) must be -250');
+  console.log(`[PASS] Test 30 (BusyBox ls -al SMULH): 0x9b407c40 (-250) verified`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1328,7 +1350,8 @@ async function testWait4EchildAndGetgroups() {
   await testInsAndDupElement();
   await testSxtlUxtl();
   await testWait4EchildAndGetgroups();
-  console.log('\nALL 29 TESTS PASSED.');
+  await testSmulh();
+  console.log('\nALL 30 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);
