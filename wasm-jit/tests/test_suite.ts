@@ -1197,6 +1197,29 @@ async function testAuditHardening() {
   console.log(`[PASS] Test 25 (Audit Hardening): PRFM safe, F_DUPFD_CLOEXEC=10, /dev/null=EOF`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 26: Unified FP/SIMD B/H/S/D/Q Load/Store (0x3d0042c0 STR B0, [X22, #16])
+// ---------------------------------------------------------------------------
+async function testUnifiedSimdLoadStore() {
+  const code = [
+    A64.subImm(31, 31, 64),
+    A64.addImm(22, 31, 0),    // x22 = sp
+    0x4f00e440,               // MOVI V0.16B, #2 (B0 = 0x02)
+    0x3d0042c0,               // exact iPhone opcode at PC=0x9b71c: STR B0, [X22, #16]
+    // Load back byte at [X22, #16] into X19 -> expect 2!
+    ((0x394042d3) >>> 0),     // ldrb w19, [x22, #16]
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 2n, 'STR B0 (0x3d0042c0) failed');
+  console.log(`[PASS] Test 26 (Unified FP/SIMD B/H/S/D/Q Load/Store): 0x3d0042c0 (STR B0)=2 verified`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1223,7 +1246,8 @@ async function testAuditHardening() {
   await testMoviAndSimdBitwise();
   await testSimdStrQNotHijackedByGP();
   await testAuditHardening();
-  console.log('\nALL 25 TESTS PASSED.');
+  await testUnifiedSimdLoadStore();
+  console.log('\nALL 26 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

@@ -1224,27 +1224,74 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       continue;
     }
 
-    // 31. 128-bit SIMD LDR/STR Qt, [Xn, #uimm12*16] (unsigned offset)
-    if (((insn & 0xff800000) >>> 0) === 0x3d800000 || ((insn & 0xff800000) >>> 0) === 0x3dc00000) {
-      const isLoad = ((insn >>> 22) & 1) === 1;
+    // 31. Unified FP/SIMD LDR/STR (B=1B, H=2B, S=4B, D=8B, Q=16B): unsigned imm, LDUR/STUR, pre/post-index, reg offset
+    if (((insn & 0x3f000000) >>> 0) === 0x3d000000) {
+      const size = (insn >>> 30) & 0x3;
+      const opc = (insn >>> 22) & 0x3;
+      const isLoad = (opc & 1) === 1;
+      const isQ = (opc & 2) === 2 && size === 0;
+      const scale = isQ ? 4 : size;
+      const width = 1 << scale;
       const imm12 = (insn >>> 10) & 0xfff;
       const rn = (insn >>> 5) & 0x1f;
-      const qt = insn & 0x1f;
+      const vt = insn & 0x1f;
       c.getReg(rn, true, false);
-      if (imm12 > 0) { c.i64Const(BigInt(imm12 * 16)); c.op(OP.I64_ADD); }
+      if (imm12 > 0) { c.i64Const(BigInt(imm12 << scale)); c.op(OP.I64_ADD); }
       c.op(OP.I32_WRAP_I64);
       c.localSet(3);
-      if (isLoad) {
-        c.i32Const(OFF_Q(qt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
-        c.i32Const(OFF_Q(qt) + 8); c.localGet(3); c.loadI64(8, 3); c.storeI64(0, 3);
-      } else {
-        c.localGet(3); c.i32Const(OFF_Q(qt)); c.loadI64(0, 3); c.storeI64(0, 3);
-        c.localGet(3); c.i32Const(OFF_Q(qt) + 8); c.loadI64(0, 3); c.storeI64(8, 3);
+      emitSimdLoadStoreAtLocal3(c, width, isLoad, vt);
+      pc = nextPC;
+      continue;
+    }
+    if (
+      ((insn & 0x3f200c00) >>> 0) === 0x3c000000 ||
+      ((insn & 0x3f200c00) >>> 0) === 0x3c000400 ||
+      ((insn & 0x3f200c00) >>> 0) === 0x3c000c00
+    ) {
+      const size = (insn >>> 30) & 0x3;
+      const opc = (insn >>> 22) & 0x3;
+      const isLoad = (opc & 1) === 1;
+      const isQ = (opc & 2) === 2 && size === 0;
+      const width = isQ ? 16 : 1 << size;
+      const mode = (insn >>> 10) & 0x3;
+      const imm9 = signExtend((insn >>> 12) & 0x1ff, 9);
+      const rn = (insn >>> 5) & 0x1f;
+      const vt = insn & 0x1f;
+      c.getReg(rn, true, false);
+      if (mode === 0 || mode === 3) { c.i64Const(BigInt(imm9)); c.op(OP.I64_ADD); }
+      c.op(OP.I32_WRAP_I64);
+      c.localSet(3);
+      emitSimdLoadStoreAtLocal3(c, width, isLoad, vt);
+      if (mode === 1 || mode === 3) {
+        if (c.beginSetReg(rn, true)) {
+          c.getReg(rn, true, false); c.i64Const(BigInt(imm9)); c.op(OP.I64_ADD); c.endSetReg(rn, true, false);
+        }
       }
       pc = nextPC;
       continue;
     }
-
+    if (((insn & 0x3f200c00) >>> 0) === 0x3c200800) {
+      const size = (insn >>> 30) & 0x3;
+      const opc = (insn >>> 22) & 0x3;
+      const isLoad = (opc & 1) === 1;
+      const isQ = (opc & 2) === 2 && size === 0;
+      const scale = isQ ? 4 : size;
+      const width = 1 << scale;
+      const rm = (insn >>> 16) & 0x1f;
+      const option = (insn >>> 13) & 0x7;
+      const sBit = ((insn >>> 12) & 1) === 1;
+      const rn = (insn >>> 5) & 0x1f;
+      const vt = insn & 0x1f;
+      c.getReg(rn, true, false);
+      c.getReg(rm, false, false);
+      emitExtend(c, option);
+      if (sBit && scale > 0) { c.i64Const(BigInt(scale)); c.op(OP.I64_SHL); }
+      c.op(OP.I64_ADD, OP.I32_WRAP_I64);
+      c.localSet(3);
+      emitSimdLoadStoreAtLocal3(c, width, isLoad, vt);
+      pc = nextPC;
+      continue;
+    }
 
     // 32. SIMD MOVI (all lanes: 8B/16B, 4H/8H, 2S/4S, 2D — covers 0x4F00E400 & 0x4F00E440!)
     if (((insn & 0x9ff80c00) >>> 0) === 0x0f000400) {
@@ -1310,77 +1357,6 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       continue;
     }
 
-    // 32c. 64-bit FP/SIMD D-reg LDUR/STUR & pre/post-index (0xFC000000 / 0xFC400000)
-    if (
-      ((insn & 0xffa00c00) >>> 0) === 0xfc000000 ||
-      ((insn & 0xffa00c00) >>> 0) === 0xfc000400 ||
-      ((insn & 0xffa00c00) >>> 0) === 0xfc000c00
-    ) {
-      const isLoad = ((insn >>> 22) & 1) === 1;
-      const mode = (insn >>> 10) & 0x3;
-      const imm9 = signExtend((insn >>> 12) & 0x1ff, 9);
-      const rn = (insn >>> 5) & 0x1f;
-      const dt = insn & 0x1f;
-      c.getReg(rn, true, false);
-      if (mode === 0 || mode === 3) { c.i64Const(BigInt(imm9)); c.op(OP.I64_ADD); }
-      c.op(OP.I32_WRAP_I64);
-      c.localSet(3);
-      if (isLoad) {
-        c.i32Const(OFF_Q(dt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
-        c.i32Const(OFF_Q(dt) + 8); c.i64Const(0n); c.storeI64(0, 3);
-      } else {
-        c.localGet(3); c.i32Const(OFF_Q(dt)); c.loadI64(0, 3); c.storeI64(0, 3);
-      }
-      if (mode === 1 || mode === 3) {
-        if (c.beginSetReg(rn, true)) {
-          c.getReg(rn, true, false); c.i64Const(BigInt(imm9)); c.op(OP.I64_ADD); c.endSetReg(rn, true, false);
-        }
-      }
-      pc = nextPC;
-      continue;
-    }
-
-    // 33. 128-bit SIMD LDUR/STUR & pre/post-index LDR/STR Qt, [Xn, #simm9]
-    if (
-      ((insn & 0xffa00c00) >>> 0) === 0x3c800000 ||
-      ((insn & 0xffa00c00) >>> 0) === 0x3c800400 ||
-      ((insn & 0xffa00c00) >>> 0) === 0x3c800c00
-    ) {
-      const isLoad = ((insn >>> 22) & 1) === 1;
-      const mode = (insn >>> 10) & 0x3; // 0=unscaled, 1=post, 3=pre
-      const imm9 = signExtend((insn >>> 12) & 0x1ff, 9);
-      const rn = (insn >>> 5) & 0x1f;
-      const qt = insn & 0x1f;
-
-      c.getReg(rn, true, false);
-      if (mode === 0 || mode === 3) {
-        c.i64Const(BigInt(imm9));
-        c.op(OP.I64_ADD);
-      }
-      c.op(OP.I32_WRAP_I64);
-      c.localSet(3);
-
-      if (isLoad) {
-        c.i32Const(OFF_Q(qt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
-        c.i32Const(OFF_Q(qt) + 8); c.localGet(3); c.loadI64(8, 3); c.storeI64(0, 3);
-      } else {
-        c.localGet(3); c.i32Const(OFF_Q(qt)); c.loadI64(0, 3); c.storeI64(0, 3);
-        c.localGet(3); c.i32Const(OFF_Q(qt) + 8); c.loadI64(0, 3); c.storeI64(8, 3);
-      }
-
-      if (mode === 1 || mode === 3) {
-        if (c.beginSetReg(rn, true)) {
-          c.getReg(rn, true, false);
-          c.i64Const(BigInt(imm9));
-          c.op(OP.I64_ADD);
-          c.endSetReg(rn, true, false);
-        }
-      }
-      pc = nextPC;
-      continue;
-    }
-
-
     // 34. ADC / ADCS / SBC / SBCS
     if (((insn & 0x1fe0fc00) >>> 0) === 0x1a000000) {
       const is64 = (insn >>> 31) === 1;
@@ -1420,25 +1396,6 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
         c.op(OP.I64_MUL);
         c.op(isSub ? OP.I64_SUB : OP.I64_ADD);
         c.endSetReg(rd, false, false);
-      }
-      pc = nextPC;
-      continue;
-    }
-
-    // 36. 64-bit FP/SIMD D-reg LDR/STR unsigned offset (0xFD000000 / 0xFD400000)
-    if (((insn & 0xff800000) >>> 0) === 0xfd000000 || ((insn & 0xff800000) >>> 0) === 0xfd400000) {
-      const isLoad = ((insn >>> 22) & 1) === 1;
-      const imm12 = (insn >>> 10) & 0xfff;
-      const rn = (insn >>> 5) & 0x1f;
-      const dt = insn & 0x1f;
-      c.getReg(rn, true, false);
-      if (imm12 > 0) { c.i64Const(BigInt(imm12 * 8)); c.op(OP.I64_ADD); }
-      c.op(OP.I32_WRAP_I64);
-      c.localSet(3);
-      if (isLoad) {
-        c.i32Const(OFF_Q(dt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
-      } else {
-        c.localGet(3); c.i32Const(OFF_Q(dt)); c.loadI64(0, 3); c.storeI64(0, 3);
       }
       pc = nextPC;
       continue;
@@ -1612,25 +1569,6 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       continue;
     }
 
-    // 45. FP/SIMD 32-bit S-reg LDR/STR unsigned offset (0xBD000000 / 0xBD400000)
-    if (((insn & 0xff800000) >>> 0) === 0xbd000000 || ((insn & 0xff800000) >>> 0) === 0xbd400000) {
-      const isLoad = ((insn >>> 22) & 1) === 1;
-      const imm12 = (insn >>> 10) & 0xfff;
-      const rn = (insn >>> 5) & 0x1f;
-      const st = insn & 0x1f;
-      c.getReg(rn, true, false);
-      if (imm12 > 0) { c.i64Const(BigInt(imm12 * 4)); c.op(OP.I64_ADD); }
-      c.op(OP.I32_WRAP_I64);
-      c.localSet(3);
-      if (isLoad) {
-        c.i32Const(OFF_Q(st)); c.localGet(3); c.op(OP.I64_LOAD32_U, 2, 0); c.storeI64(0, 3);
-        c.i32Const(OFF_Q(st) + 8); c.i64Const(0n); c.storeI64(0, 3);
-      } else {
-        c.localGet(3); c.i32Const(OFF_Q(st)); c.loadI32(0, 2); c.storeI32(0, 2);
-      }
-      pc = nextPC;
-      continue;
-    }
     // Unrecognized instruction -> fault
     c.setPC(pc);
     c.i32Const(STATUS.FAULT);
@@ -1647,6 +1585,40 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
 
   mb.addFunction(tBlock, [[3, VALTYPE.I64], [1, VALTYPE.I32], [2, VALTYPE.I64]], c.b, 'bb');
   return new WebAssembly.Module(mb.toUint8Array() as BufferSource);
+}
+
+function emitSimdLoadStoreAtLocal3(c: CodeBuf, width: number, isLoad: boolean, vt: number): void {
+  if (isLoad) {
+    c.i32Const(OFF_Q(vt));
+    c.localGet(3);
+    if (width === 1) c.op(OP.I64_LOAD8_U, 0, 0);
+    else if (width === 2) c.op(OP.I64_LOAD16_U, 1, 0);
+    else if (width === 4) c.op(OP.I64_LOAD32_U, 2, 0);
+    else c.loadI64(0, 3);
+    c.storeI64(0, 3);
+    c.i32Const(OFF_Q(vt) + 8);
+    if (width === 16) {
+      c.localGet(3);
+      c.loadI64(8, 3);
+    } else {
+      c.i64Const(0n);
+    }
+    c.storeI64(0, 3);
+  } else {
+    c.localGet(3);
+    c.i32Const(OFF_Q(vt));
+    c.loadI64(0, 3);
+    if (width === 1) c.op(OP.I64_STORE8, 0, 0);
+    else if (width === 2) c.op(OP.I64_STORE16, 1, 0);
+    else if (width === 4) c.op(OP.I64_STORE32, 2, 0);
+    else c.storeI64(0, 3);
+    if (width === 16) {
+      c.localGet(3);
+      c.i32Const(OFF_Q(vt) + 8);
+      c.loadI64(0, 3);
+      c.storeI64(8, 3);
+    }
+  }
 }
 
 function emitExtend(c: CodeBuf, option: number): void {
