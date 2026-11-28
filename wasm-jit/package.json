@@ -1,0 +1,18 @@
+{
+  "name": "iterminal-wasm-jit",
+  "version": "3.0.0",
+  "description": "On-device AArch64-to-WASM Dynamic Binary Translator & Linux Runtime for iOS WKWebView (TypeScript)",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:node": "esbuild src/dbt-runtime.ts src/vmm-syscalls.ts src/vfs-memfs.ts src/rootfs-tar.ts src/wasm-encoder-v2.ts tests/test_suite.ts --outdir=dist/node --format=cjs --platform=node --target=node20",
+    "build:ios": "esbuild runtime/guest-v2.ts --bundle --format=iife --target=safari16 --outfile=dist/ios/iterminal-runtime.js",
+    "build": "npm run build:node && npm run build:ios",
+    "test": "npm run build:node && node dist/node/tests/test_suite.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

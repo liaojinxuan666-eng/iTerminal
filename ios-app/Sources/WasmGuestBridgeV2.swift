@@ -49,11 +49,7 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
     public override init() { super.init() }
 
     public func setup(
-        encoderJS: String,
-        dbtRuntimeJS: String,
-        vfsMemFSJS: String,
-        vmmSyscallsJS: String,
-        guestV2JS: String,
+        runtimeJS: String,
         completion: @escaping (Error?) -> Void
     ) {
         self.bootstrapCompletion = completion
@@ -61,9 +57,7 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         let contentController = WKUserContentController()
         contentController.add(self, name: "iosHost")
 
-        let combined = [encoderJS, dbtRuntimeJS, vfsMemFSJS, vmmSyscallsJS, guestV2JS]
-            .joined(separator: "\n;\n")
-        let script = WKUserScript(source: combined, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        let script = WKUserScript(source: runtimeJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         contentController.addUserScript(script)
         config.userContentController = contentController
 

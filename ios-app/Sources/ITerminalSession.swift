@@ -24,25 +24,25 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         bridge.delegate = self
     }
 
+    /// Loads the single esbuild-compiled `iterminal-runtime.js` bundle from `Bundle.main`.
     public func startBundledRuntime() {
         guard !isReady else { return }
-        guard let encoderJS = loadBundledJS(named: "wasm-encoder-v2"),
-              let dbtRuntimeJS = loadBundledJS(named: "dbt-runtime"),
-              let vfsMemFSJS = loadBundledJS(named: "vfs-memfs"),
-              let rootfsTarJS = loadBundledJS(named: "rootfs-tar"),
-              let vmmSyscallsJS = loadBundledJS(named: "vmm-syscalls"),
-              let guestV2JS = loadBundledJS(named: "guest-v2") else {
-            statusText = "Missing bundled wasm-jit runtime JS files"
+        guard let runtimeJS = loadBundledJS(named: "iterminal-runtime") else {
+            statusText = "Missing bundled iterminal-runtime.js"
             return
         }
-        startRuntime(
-            encoderJS: encoderJS,
-            dbtRuntimeJS: dbtRuntimeJS,
-            vfsMemFSJS: vfsMemFSJS,
-            rootfsTarJS: rootfsTarJS,
-            vmmSyscallsJS: vmmSyscallsJS,
-            guestV2JS: guestV2JS
-        )
+        statusText = "Bootstrapping WebKit JIT..."
+        bridge.setup(runtimeJS: runtimeJS) { [weak self] err in
+            Task { @MainActor in
+                guard let self = self else { return }
+                if let err = err {
+                    self.statusText = "Bootstrap error: \(err.localizedDescription)"
+                    return
+                }
+                self.isReady = true
+                self.mountAndBootDefaultShell()
+            }
+        }
     }
 
     private func loadBundledJS(named name: String) -> String? {
@@ -66,36 +66,6 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         return candidates.compactMap({ $0 }).first
     }
 
-    public func startRuntime(
-        encoderJS: String,
-        dbtRuntimeJS: String,
-        vfsMemFSJS: String,
-        rootfsTarJS: String,
-        vmmSyscallsJS: String,
-        guestV2JS: String
-    ) {
-        statusText = "Bootstrapping WebKit JIT..."
-        let combinedVfs = vfsMemFSJS + "\n;\n" + rootfsTarJS
-        bridge.setup(
-            encoderJS: encoderJS,
-            dbtRuntimeJS: dbtRuntimeJS,
-            vfsMemFSJS: combinedVfs,
-            vmmSyscallsJS: vmmSyscallsJS,
-            guestV2JS: guestV2JS
-        ) { [weak self] err in
-            Task { @MainActor in
-                guard let self = self else { return }
-                if let err = err {
-                    self.statusText = "Bootstrap error: \(err.localizedDescription)"
-                    return
-                }
-                self.isReady = true
-                self.mountAndBootDefaultShell()
-            }
-        }
-    }
-
-    /// Mount bundled Alpine minirootfs.tar (or persisted snapshot) and boot `/bin/sh`.
     public func mountAndBootDefaultShell() {
         if FileManager.default.fileExists(atPath: snapshotURL.path) {
             try? bridge.loadRootFS(from: snapshotURL)
@@ -151,8 +121,6 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
     public func persistRootFS() {
         bridge.saveRootFS(to: snapshotURL)
     }
-
-    // MARK: - GuestHostDelegate
 
     nonisolated public func guestDidWriteStdout(_ text: String) {
         Task { @MainActor in self.outputLog.append(text) }
