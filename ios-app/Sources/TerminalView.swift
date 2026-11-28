@@ -7,16 +7,22 @@ struct TerminalView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Status bar
-                HStack {
+                HStack(spacing: 6) {
                     Circle()
-                        .fill(session.isReady ? Color.green : Color.orange)
+                        .fill(session.isRunning ? Color.green : (session.isReady ? Color.yellow : Color.orange))
                         .frame(width: 8, height: 8)
                     Text(session.statusText)
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer()
+                    Button("Boot sh") {
+                        session.bootShell()
+                    }
+                    .font(.system(.caption2, design: .monospaced))
+                    .buttonStyle(.bordered)
+                    .tint(.green)
+
                     Button("Ctrl-C") {
                         session.sendCtrlC()
                     }
@@ -36,10 +42,9 @@ struct TerminalView: View {
 
                 Divider()
 
-                // Terminal output viewport
                 ScrollViewReader { proxy in
                     ScrollView {
-                        Text(session.outputLog.isEmpty ? "iTerminal (WebKit JSC JIT)\nReady. Place AArch64 ELF or Alpine minirootfs.tar in Documents to boot.\n" : session.outputLog)
+                        Text(session.outputLog.isEmpty ? "iTerminal (WebKit JSC JIT)\nInitializing...\n" : session.outputLog)
                             .font(.system(size: 13, design: .monospaced))
                             .foregroundStyle(Color(red: 0.85, green: 0.96, blue: 0.85))
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -57,7 +62,6 @@ struct TerminalView: View {
 
                 Divider()
 
-                // Command input bar
                 HStack(spacing: 8) {
                     Text("$")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))

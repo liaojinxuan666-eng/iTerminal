@@ -36,14 +36,11 @@ public final class ITerminalSchemeHandler: NSObject, WKURLSchemeHandler {
     public func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
 }
 
-/// iTerminal wasm-jit v2.3 WKWebView Host Bridge:
-/// - Runs on-device AArch64->WASM DBT + PIE/PT_INTERP dynamic binaries inside JSC JIT
-/// - Bridges blocking BSD TCP sockets to iOS Network.framework (NWConnection)
-/// - Persists MemFS snapshots to iOS app Documents sandbox
 public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private var webView: WKWebView!
     public weak var delegate: GuestHostDelegate?
     private var isBootstrapped = false
+    private var bootstrapCompletion: ((Error?) -> Void)?
 
     private let netQueue = DispatchQueue(label: "com.iterminal.net")
     private var sockets: [Int: NWConnection] = [:]
@@ -59,6 +56,7 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         guestV2JS: String,
         completion: @escaping (Error?) -> Void
     ) {
+        self.bootstrapCompletion = completion
         let config = WKWebViewConfiguration()
         let contentController = WKUserContentController()
         contentController.add(self, name: "iosHost")
@@ -78,13 +76,18 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
 
         if let url = URL(string: "iterminal-host://runtime/index.html") {
             wv.load(URLRequest(url: url))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.isBootstrapped = true
-                completion(nil)
-            }
         } else {
+            self.bootstrapCompletion = nil
             completion(NSError(domain: "WasmGuestBridgeV2", code: -1))
         }
+    }
+
+    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !isBootstrapped else { return }
+        isBootstrapped = true
+        let cb = bootstrapCompletion
+        bootstrapCompletion = nil
+        cb?(nil)
     }
 
     public func mountFile(path: String, data: Data, mode: Int = 0o755) {
@@ -100,7 +103,49 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         evalJS("window.__iTerminalMountSymlink('\(t)', '\(l)');")
     }
 
-    /// Persist MemFS state to iOS sandbox `Documents/iTerminalRootFS.json`.
+    /// Extract a POSIX USTAR `.tar` archive (e.g. Alpine minirootfs.tar) directly into MemFS.
+    public func mountTar(_ tarData: Data, completion: @escaping (Result<Int, Error>) -> Void) {
+        guard isBootstrapped else {
+            completion(.failure(NSError(domain: "WasmGuestBridgeV2", code: -2)))
+            return
+        }
+        let b64 = tarData.base64EncodedString()
+        DispatchQueue.main.async { [weak self] in
+            self?.webView.callAsyncJavaScript(
+                "return window.__iTerminalMountTar(b64);",
+                arguments: ["b64": b64],
+                in: nil,
+                in: .page
+            ) { result in
+                switch result {
+                case .success(let val):
+                    completion(.success((val as? Int) ?? 0))
+                case .failure(let err):
+                    completion(.failure(err))
+                }
+            }
+        }
+    }
+
+    /// Boot a binary already mounted in MemFS (e.g. `/bin/sh` -> `/bin/busybox`).
+    public func runFromVFS(
+        path: String,
+        argv: [String]? = nil,
+        envp: [String] = ["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", "TERM=xterm-256color"],
+        sliceBudget: Int = 4096
+    ) {
+        guard isBootstrapped else { return }
+        let escaped = path.replacingOccurrences(of: "'", with: "\\'")
+        let opts: [String: Any] = [
+            "argv": argv ?? [path],
+            "envp": envp,
+            "sliceBudget": sliceBudget,
+        ]
+        let optsJSON = (try? JSONSerialization.data(withJSONObject: opts))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        evalJS("window.__iTerminalRunVFS('\(escaped)', \(optsJSON));")
+    }
+
     public func saveRootFS(to url: URL, completion: ((Error?) -> Void)? = nil) {
         DispatchQueue.main.async { [weak self] in
             self?.webView.evaluateJavaScript("window.__iTerminalExportFS();") { result, error in
@@ -116,7 +161,6 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         }
     }
 
-    /// Restore MemFS state from iOS sandbox `Documents/iTerminalRootFS.json`.
     public func loadRootFS(from url: URL) throws {
         let json = try String(contentsOf: url, encoding: .utf8)
         let data = try JSONSerialization.data(withJSONObject: [json])
@@ -138,7 +182,7 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
     public func runELF(
         _ elfData: Data,
         argv: [String] = ["/bin/sh"],
-        envp: [String] = ["PATH=/bin:/usr/bin", "HOME=/root", "TERM=xterm-256color"],
+        envp: [String] = ["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", "TERM=xterm-256color"],
         exePath: String? = nil,
         sliceBudget: Int = 4096
     ) {

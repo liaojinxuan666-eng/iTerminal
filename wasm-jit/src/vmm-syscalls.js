@@ -41,6 +41,11 @@
     EXIT_GROUP: 94,
     SET_TID_ADDRESS: 96,
     FUTEX: 98,
+    SET_ROBUST_LIST: 99,
+    SIGALTSTACK: 132,
+    PRCTL: 167,
+    GETTID: 178,
+    MADVISE: 233,
     CLOCK_GETTIME: 113,
     KILL: 129,
     TKILL: 130,
@@ -531,7 +536,14 @@
           return ret(old);
         }
 
-        case SYS.SET_TID_ADDRESS: return ret(proc.pid);
+        case SYS.SET_TID_ADDRESS:
+        case SYS.GETTID:
+          return ret(proc.pid);
+        case SYS.SET_ROBUST_LIST:
+        case SYS.SIGALTSTACK:
+        case SYS.PRCTL:
+        case SYS.MADVISE:
+          return ret(0);
         case SYS.FUTEX: return ret(0);
         case SYS.BRK: return ret(proc.vmm.brk(cpu, a0));
         case SYS.MMAP: {

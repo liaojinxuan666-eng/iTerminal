@@ -24,7 +24,6 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         bridge.delegate = self
     }
 
-    /// Automatically loads bundled `wasm-jit` JS runtime files from `Bundle.main` and starts WebKit JIT.
     public func startBundledRuntime() {
         guard !isReady else { return }
         guard let encoderJS = loadBundledJS(named: "wasm-encoder-v2"),
@@ -52,11 +51,19 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
             Bundle.main.url(forResource: name, withExtension: "js", subdirectory: "runtime"),
         ]
         for url in candidates.compactMap({ $0 }) {
-            if let text = try? String(contentsOf: url, encoding: .utf8) {
-                return text
-            }
+            if let text = try? String(contentsOf: url, encoding: .utf8) { return text }
         }
         return nil
+    }
+
+    private func findRootFSTarURL() -> URL? {
+        let userTar = documentsURL.appendingPathComponent("minirootfs.tar")
+        if FileManager.default.fileExists(atPath: userTar.path) { return userTar }
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: "alpine-minirootfs", withExtension: "tar"),
+            Bundle.main.url(forResource: "alpine-minirootfs", withExtension: "tar", subdirectory: "runtime"),
+        ]
+        return candidates.compactMap({ $0 }).first
     }
 
     public func startRuntime(
@@ -82,13 +89,48 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
                     self.statusText = "Bootstrap error: \(err.localizedDescription)"
                     return
                 }
-                if FileManager.default.fileExists(atPath: self.snapshotURL.path) {
-                    try? self.bridge.loadRootFS(from: self.snapshotURL)
-                }
                 self.isReady = true
-                self.statusText = "Ready (WebKit JSC JIT active)"
+                self.mountAndBootDefaultShell()
             }
         }
+    }
+
+    /// Mount bundled Alpine minirootfs.tar (or persisted snapshot) and boot `/bin/sh`.
+    public func mountAndBootDefaultShell() {
+        if FileManager.default.fileExists(atPath: snapshotURL.path) {
+            try? bridge.loadRootFS(from: snapshotURL)
+            outputLog.append("[iTerminal] Restored RootFS snapshot from Documents.\n")
+            bootShell()
+            return
+        }
+        guard let tarURL = findRootFSTarURL(), let tarData = try? Data(contentsOf: tarURL) else {
+            statusText = "Ready (no minirootfs.tar bundled)"
+            outputLog.append("[iTerminal] No alpine-minirootfs.tar found. Place minirootfs.tar in Documents.\n")
+            return
+        }
+        statusText = "Extracting Alpine rootfs..."
+        outputLog.append("[iTerminal] Mounting \(tarURL.lastPathComponent) (\(tarData.count / 1024) KB)...\n")
+        bridge.mountTar(tarData) { [weak self] result in
+            Task { @MainActor in
+                guard let self = self else { return }
+                switch result {
+                case .success(let count):
+                    self.outputLog.append("[iTerminal] Mounted \(count) entries into MemFS.\n")
+                    self.bootShell()
+                case .failure(let err):
+                    self.statusText = "RootFS mount failed"
+                    self.outputLog.append("[iTerminal] Mount error: \(err.localizedDescription)\n")
+                }
+            }
+        }
+    }
+
+    public func bootShell() {
+        guard isReady else { return }
+        isRunning = true
+        statusText = "Running /bin/sh (WebKit JSC JIT)"
+        outputLog.append("[iTerminal] Booting /bin/sh...\n")
+        bridge.runFromVFS(path: "/bin/sh", argv: ["/bin/sh", "-i"])
     }
 
     public func sendLine(_ line: String) {

@@ -1127,6 +1127,56 @@
         continue;
       }
 
+
+      // 32. SIMD MOVI Vd.16B/8B, #0 (0x4F00E400 / 0x0F00E400) & EOR Vd, Vn, Vn (musl memset zero)
+      if (((insn & 0xbffffff0) >>> 0) === 0x0f00e400 || (((insn & 0xbfe0fc00) >>> 0) === 0x2e201c00 && ((insn >>> 16) & 0x1f) === ((insn >>> 5) & 0x1f))) {
+        const qt = insn & 0x1f;
+        c.i32Const(OFF_Q(qt)); c.i64Const(0n); c.storeI64(0, 3);
+        c.i32Const(OFF_Q(qt) + 8); c.i64Const(0n); c.storeI64(0, 3);
+        pc = nextPC;
+        continue;
+      }
+
+      // 33. 128-bit SIMD LDUR/STUR & pre/post-index LDR/STR Qt, [Xn, #simm9]
+      if (
+        ((insn & 0xffa00c00) >>> 0) === 0x3c800000 ||
+        ((insn & 0xffa00c00) >>> 0) === 0x3c800400 ||
+        ((insn & 0xffa00c00) >>> 0) === 0x3c800c00
+      ) {
+        const isLoad = ((insn >>> 22) & 1) === 1;
+        const mode = (insn >>> 10) & 0x3; // 0=unscaled, 1=post, 3=pre
+        const imm9 = signExtend((insn >>> 12) & 0x1ff, 9);
+        const rn = (insn >>> 5) & 0x1f;
+        const qt = insn & 0x1f;
+
+        c.getReg(rn, true, false);
+        if (mode === 0 || mode === 3) {
+          c.i64Const(BigInt(imm9));
+          c.op(OP.I64_ADD);
+        }
+        c.op(OP.I32_WRAP_I64);
+        c.localSet(3);
+
+        if (isLoad) {
+          c.i32Const(OFF_Q(qt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.i32Const(OFF_Q(qt) + 8); c.localGet(3); c.loadI64(8, 3); c.storeI64(0, 3);
+        } else {
+          c.localGet(3); c.i32Const(OFF_Q(qt)); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.localGet(3); c.i32Const(OFF_Q(qt) + 8); c.loadI64(0, 3); c.storeI64(8, 3);
+        }
+
+        if (mode === 1 || mode === 3) {
+          if (c.beginSetReg(rn, true)) {
+            c.getReg(rn, true, false);
+            c.i64Const(BigInt(imm9));
+            c.op(OP.I64_ADD);
+            c.endSetReg(rn, true, false);
+          }
+        }
+        pc = nextPC;
+        continue;
+      }
+
       // Unrecognized instruction -> fault
       c.setPC(pc);
       c.i32Const(STATUS.FAULT);
