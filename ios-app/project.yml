@@ -1,0 +1,31 @@
+name: iTerminal
+options:
+  bundleIdPrefix: com.iterminal
+  deploymentTarget:
+    iOS: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    PRODUCT_BUNDLE_IDENTIFIER: com.iterminal.app
+    MARKETING_VERSION: "0.2.4"
+    CURRENT_PROJECT_VERSION: "1"
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  iTerminal:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    info:
+      path: Info.plist
+    sources:
+      - path: Sources
+      - path: Resources/runtime
+        buildPhase: resources
+        optional: true
+    settings:
+      base:
+        INFOPLIST_FILE: Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Manual

@@ -4,6 +4,7 @@ const assert = require('assert');
 const { performance } = require('perf_hooks');
 const WasmDBT = require('../src/dbt-runtime');
 const { MemFS } = require('../src/vfs-memfs');
+const RootFSTar = require('../src/rootfs-tar');
 const { SYS, SIG, IOCTL_CMD, GuestKernel } = require('../src/vmm-syscalls');
 
 // ---------------------------------------------------------------------------
@@ -803,6 +804,156 @@ async function testMemFSPersistence() {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Test 15: POSIX USTAR .tar RootFS Unpack & Boot (/bin/sh -> /bin/busybox)
+// ---------------------------------------------------------------------------
+async function testTarRootFSBoot() {
+  // Mini busybox binary that reads /etc/alpine-release and prints it to stdout
+  const sPath = new TextEncoder().encode('/etc/alpine-release\0');
+  const code = [
+    A64.subImm(31, 31, 64),
+    A64.movn(0, 99),
+    A64.movz(1, 0, 0), // patched
+    A64.movk(1, 0, 1),
+    A64.movz(2, 0), A64.movz(3, 0), A64.movz(8, SYS.OPENAT), A64.svc(0),
+    A64.movReg(19, 0),
+    A64.movReg(0, 19), A64.addImm(1, 31, 0), A64.movz(2, 64), A64.movz(8, SYS.READ), A64.svc(0),
+    A64.movReg(2, 0), A64.movz(0, 1), A64.addImm(1, 31, 0), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const baseVaddr = 0x10000;
+  const dataOff = (code.length * 4 + 15) & ~15;
+  const sAddr = baseVaddr + dataOff;
+  code[2] = A64.movz(1, sAddr & 0xffff, 0);
+  code[3] = A64.movk(1, (sAddr >>> 16) & 0xffff, 1);
+  const { elf } = buildELF64(code, sPath, baseVaddr);
+
+  const tarBytes = RootFSTar.buildTar([
+    { path: 'bin', type: 'dir', mode: 0o755 },
+    { path: 'etc', type: 'dir', mode: 0o755 },
+    { path: 'bin/busybox', type: 'file', data: elf, mode: 0o755 },
+    { path: 'bin/sh', type: 'symlink', target: '/bin/busybox' },
+    { path: 'etc/alpine-release', type: 'file', data: '3.20.3-iterminal\n', mode: 0o644 },
+  ]);
+
+  const fs = new MemFS();
+  const count = RootFSTar.extractTarToMemFS(tarBytes, fs);
+  assert.strictEqual(count, 5);
+
+  let stdout = '';
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
+    fs,
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
+  });
+  kernel.spawnELF(fs.readFile('/bin/sh'), { argv: ['/bin/sh'] });
+  await kernel.runAll();
+
+  assert.strictEqual(stdout, '3.20.3-iterminal\n');
+  console.log(`[PASS] Test 15 (USTAR .tar RootFS Boot): extracted ${count} entries, /bin/sh -> "${stdout.trim()}"`);
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: File-Backed mmap + MAP_FIXED Shared Library Code Execution via Lazy DBT
+// ---------------------------------------------------------------------------
+async function testFileBackedMmapSharedLib() {
+  // Shared library raw AArch64 code page (`/lib/libmath.so`): add x0, x0, #42; ret
+  const libCode = new Uint8Array(8);
+  const ldv = new DataView(libCode.buffer);
+  ldv.setUint32(0, A64.addImm(0, 0, 42), true);
+  ldv.setUint32(4, A64.ret(30), true);
+
+  const sLib = new TextEncoder().encode('/lib/libmath.so\0');
+  const code = [
+    // openat(-100, "/lib/libmath.so", 0, 0) -> x19
+    A64.movn(0, 99),
+    A64.movz(1, 0, 0), // patched
+    A64.movk(1, 0, 1),
+    A64.movz(2, 0), A64.movz(3, 0), A64.movz(8, SYS.OPENAT), A64.svc(0),
+    A64.movReg(19, 0),
+    // mmap(0x300000, 4096, PROT_RX=5, MAP_PRIVATE|MAP_FIXED=0x12, fd=x19, off=0) -> x20
+    A64.movz(0, 0x0030, 1),      // 0x0030_0000
+    A64.movz(1, 4096),
+    A64.movz(2, 5),
+    A64.movz(3, 0x12),           // MAP_PRIVATE | MAP_FIXED (file-backed!)
+    A64.movReg(4, 19),           // fd
+    A64.movz(5, 0),              // offset
+    A64.movz(8, SYS.MMAP),
+    A64.svc(0),
+    A64.movReg(20, 0),           // mapped addr (expect 0x300000)
+    // Call into the mmap'd .so page: x0 = 100; blr x20 -> x0 = 142!
+    A64.movz(0, 100),
+    A64.blr(20),
+    A64.movReg(21, 0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const baseVaddr = 0x10000;
+  const dataOff = (code.length * 4 + 15) & ~15;
+  const sLibAddr = baseVaddr + dataOff;
+  code[1] = A64.movz(1, sLibAddr & 0xffff, 0);
+  code[2] = A64.movk(1, (sLibAddr >>> 16) & 0xffff, 1);
+
+  const { elf } = buildELF64(code, sLib, baseVaddr);
+  const fs = new MemFS();
+  fs.writeFile('/lib/libmath.so', libCode, 0o755);
+
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), { fs });
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(20), 0x300000n, 'MAP_FIXED address mismatch');
+  assert.strictEqual(proc.cpu.getReg(21), 142n, 'BLR into file-backed mmap .so failed');
+  console.log(`[PASS] Test 16 (File-Backed mmap + MAP_FIXED .so): BLR@0x300000(100) = 142`);
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: pread64 + readv Scatter-Gather I/O
+// ---------------------------------------------------------------------------
+async function testPreadAndReadv() {
+  const sFile = new TextEncoder().encode('/tmp/data.txt\0');
+  const code = [
+    A64.subImm(31, 31, 128),
+    // openat(-100, "/tmp/data.txt", 0, 0) -> x19
+    A64.movn(0, 99),
+    A64.movz(1, 0, 0), // patched
+    A64.movk(1, 0, 1),
+    A64.movz(2, 0), A64.movz(3, 0), A64.movz(8, SYS.OPENAT), A64.svc(0),
+    A64.movReg(19, 0),
+    // pread64(fd, sp, 5, offset=6) -> reads "WORLD" from "HELLO_WORLD!" without moving fd offset!
+    A64.movReg(0, 19), A64.addImm(1, 31, 0), A64.movz(2, 5), A64.movz(3, 6), A64.movz(8, SYS.PREAD64), A64.svc(0),
+    // write(1, sp, 5)
+    A64.movz(0, 1), A64.addImm(1, 31, 0), A64.movz(2, 5), A64.movz(8, SYS.WRITE), A64.svc(0),
+    // Build 2 iovecs at sp+64: iov[0]=(sp+16, 2), iov[1]=(sp+32, 3) -> readv reads "HE" + "LLO" from offset 0!
+    A64.addImm(9, 31, 16), A64.str64(9, 31, 64), A64.movz(10, 2), A64.str64(10, 31, 72),
+    A64.addImm(9, 31, 32), A64.str64(9, 31, 80), A64.movz(10, 3), A64.str64(10, 31, 88),
+    A64.movReg(0, 19), A64.addImm(1, 31, 64), A64.movz(2, 2), A64.movz(8, SYS.READV), A64.svc(0),
+    // write(1, sp+16, 2) + write(1, sp+32, 3)
+    A64.movz(0, 1), A64.addImm(1, 31, 16), A64.movz(2, 2), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movz(0, 1), A64.addImm(1, 31, 32), A64.movz(2, 3), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const baseVaddr = 0x10000;
+  const dataOff = (code.length * 4 + 15) & ~15;
+  const sAddr = baseVaddr + dataOff;
+  code[2] = A64.movz(1, sAddr & 0xffff, 0);
+  code[3] = A64.movk(1, (sAddr >>> 16) & 0xffff, 1);
+
+  const { elf } = buildELF64(code, sFile, baseVaddr);
+  const fs = new MemFS();
+  fs.writeFile('/tmp/data.txt', 'HELLO_WORLD!');
+
+  let stdout = '';
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
+    fs,
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
+  });
+  kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(stdout, 'WORLDHELLO');
+  console.log(`[PASS] Test 17 (pread64 + readv): output="${stdout}"`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -818,7 +969,10 @@ async function testMemFSPersistence() {
   await testDynamicPIEAndInterp();
   await testAsyncBSDSocket();
   await testMemFSPersistence();
-  console.log('\nALL 14 TESTS PASSED.');
+  await testTarRootFSBoot();
+  await testFileBackedMmapSharedLib();
+  await testPreadAndReadv();
+  console.log('\nALL 17 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

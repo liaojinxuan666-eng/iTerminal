@@ -31,6 +31,8 @@
     WRITE: 64,
     READV: 65,
     WRITEV: 66,
+    PREAD64: 67,
+    PWRITE64: 68,
     PPOLL: 73,
     READLINKAT: 78,
     NEWFSTATAT: 79,
@@ -143,6 +145,15 @@
     mmap(cpu, addrHint, length, prot, flags) {
       if (length <= 0) return -ERRNO.EINVAL;
       const len = alignUp(length, PAGE_SIZE);
+      const MAP_FIXED = 0x10;
+      if ((flags & MAP_FIXED) && addrHint >= 0x10000) {
+        const fixedAddr = addrHint & ~(PAGE_SIZE - 1);
+        cpu.ensureMemory(fixedAddr + len);
+        cpu.u8.fill(0, fixedAddr, fixedAddr + len);
+        this.mappings.set(fixedAddr, { len, prot, flags });
+        if (fixedAddr + len > this.mmapCursor) this.mmapCursor = alignUp(fixedAddr + len, PAGE_SIZE);
+        return fixedAddr;
+      }
       for (let i = 0; i < this.freeList.length; i++) {
         const slot = this.freeList[i];
         if (slot.len >= len) {
@@ -490,6 +501,8 @@
       const a1 = Number(cpu.getReg(1));
       const a2 = Number(cpu.getReg(2));
       const a3 = Number(cpu.getReg(3));
+      const a4 = Number(cpu.getReg(4));
+      const a5 = Number(cpu.getReg(5));
 
       const ret = (v) => {
         cpu.setReg(0, BigInt.asUintN(64, BigInt(v)));
@@ -521,7 +534,23 @@
         case SYS.SET_TID_ADDRESS: return ret(proc.pid);
         case SYS.FUTEX: return ret(0);
         case SYS.BRK: return ret(proc.vmm.brk(cpu, a0));
-        case SYS.MMAP: return ret(proc.vmm.mmap(cpu, a0, a1, a2, a3));
+        case SYS.MMAP: {
+          const addr = proc.vmm.mmap(cpu, a0, a1, a2, a3);
+          if (addr < 0) return ret(addr);
+          const MAP_ANONYMOUS = 0x20;
+          const fd = a4 | 0;
+          if ((a3 & MAP_ANONYMOUS) === 0 && fd >= 0) {
+            const fdObj = proc.fds.get(fd);
+            if (!fdObj || fdObj.kind !== 'file') return ret(-ERRNO.EBADF);
+            const fileData = this.fs.readFile(fdObj.path) || new Uint8Array(0);
+            const fileOff = a5 >>> 0;
+            if (fileOff < fileData.length) {
+              const copyLen = Math.min(a1, fileData.length - fileOff);
+              cpu.u8.set(fileData.subarray(fileOff, fileOff + copyLen), addr);
+            }
+          }
+          return ret(addr);
+        }
         case SYS.MUNMAP: return ret(proc.vmm.munmap(a0, a1));
         case SYS.MPROTECT: return ret(0);
 
@@ -841,6 +870,51 @@
             total += bytes.length;
           }
           return ret(total);
+        }
+
+
+        case SYS.READV: {
+          const fdObj = proc.fds.get(a0);
+          if (!fdObj || fdObj.kind !== 'file') return ret(-ERRNO.EBADF);
+          const fileData = this.fs.readFile(fdObj.path) || new Uint8Array(0);
+          let total = 0;
+          const dv = cpu.view;
+          for (let i = 0; i < a2; i++) {
+            const iovBase = Number(dv.getBigUint64(a1 + i * 16, true));
+            const iovLen = Number(dv.getBigUint64(a1 + i * 16 + 8, true));
+            const avail = Math.max(0, fileData.length - fdObj.offset);
+            const n = Math.min(iovLen, avail);
+            if (n > 0) {
+              cpu.u8.set(fileData.subarray(fdObj.offset, fdObj.offset + n), iovBase);
+              fdObj.offset += n;
+              total += n;
+            }
+          }
+          return ret(total);
+        }
+
+        case SYS.PREAD64: {
+          const fdObj = proc.fds.get(a0);
+          if (!fdObj || fdObj.kind !== 'file') return ret(-ERRNO.EBADF);
+          const fileData = this.fs.readFile(fdObj.path) || new Uint8Array(0);
+          const off = a3 >>> 0;
+          const avail = Math.max(0, fileData.length - off);
+          const n = Math.min(a2, avail);
+          if (n > 0) cpu.u8.set(fileData.subarray(off, off + n), a1);
+          return ret(n);
+        }
+
+        case SYS.PWRITE64: {
+          const fdObj = proc.fds.get(a0);
+          if (!fdObj || fdObj.kind !== 'file') return ret(-ERRNO.EBADF);
+          const cur = this.fs.readFile(fdObj.path) || new Uint8Array(0);
+          const off = a3 >>> 0;
+          const bytes = cpu.u8.slice(a1, a1 + a2);
+          const merged = new Uint8Array(Math.max(cur.length, off + bytes.length));
+          merged.set(cur, 0);
+          merged.set(bytes, off);
+          this.fs.writeFile(fdObj.path, merged);
+          return ret(bytes.length);
         }
 
         case SYS.READ: {
