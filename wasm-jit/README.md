@@ -1,44 +1,32 @@
-# iTerminal `wasm-jit` v2 核心升级包
+# iTerminal `wasm-jit` v2.1 升级套件
 
-本升级包面向 [liaojinxuan666-eng/iTerminal](https://github.com/liaojinxuan666-eng/iTerminal) 的 `wasm-jit` 架构，实现了从「离线静态翻译 PoC」迈向「端侧 Linux CLI 生态」的四项核心底层能力，全部代码零外部依赖（纯 UMD JS + Swift），可在 Node.js 与 iOS `WKWebView` 中直接运行。
+本升级套件面向 [liaojinxuan666-eng/iTerminal](https://github.com/liaojinxuan666-eng/iTerminal) 的 `wasm-jit` 架构，在 v2 的 WASM 内部调度循环与端侧动态翻译基础上，进一步补齐了面向 `musl` 静态 Linux CLI（如 BusyBox）的关键指令集、POSIX 内存 VFS、Linux AArch64 `argc`/`argv`/`envp`/`auxv` 启动栈与 `execve` 跨进程执行管线。全部代码零外部依赖（纯 UMD JS + Swift），可直接在 Node.js 18+ 与 iOS `WKWebView` 运行。
 
-## 文件清单与合入位置
+## 文件清单
 
-| 文件 | 对应原仓库路径 / 说明 |
+| 文件 | 核心职责 |
 | :--- | :--- |
-| `src/wasm-encoder-v2.js` | 升级自 `wasm-jit/src/wasm-encoder.js`，新增 `Table`、`call_indirect`、`loop`/`if`/`else`/`br` 与完整 `i32`/`i64` 编码 |
-| `src/dbt-runtime.js` | 端侧按需动态二进制翻译器（WASM-DBT）+ **WASM 内部调度循环**（Direct-Mapped I-Cache + `call_indirect`）+ `fork()` 内存/寄存器快照 |
-| `src/vmm-syscalls.js` | 紧凑 32 位虚拟内存管理器（`brk`/`mmap`/`munmap`）、可挂起异步 syscall 状态机（`STATUS.SYSCALL_PENDING = -2`）与多进程协作调度器（`clone`/`pipe2`/`wait4`） |
-| `ios-bridge/guest-v2.js` | `WKWebView` 侧运行时胶水，通过 `reqId` Promise 映射桥接异步 Swift 宿主 I/O（PTY `stdin` / `stdout` / `stderr`） |
-| `ios-bridge/WasmGuestBridgeV2.swift` | 升级自 `WasmGuestBridge.swift`，支持异步 `GuestHostDelegate`、`iterminal-host://` 自定义 `WKURLSchemeHandler`（注入 COOP/COEP 头，为后续 Web Worker + `SharedArrayBuffer` 预留）与 Jetsam 进程终止回调 |
-| `tests/test_suite.js` | 自包含 AArch64 汇编器 + ELF64 构造器 + 5 项端到端测试与性能基准（无需交叉编译器即可验证） |
+| `src/wasm-encoder-v2.js` | 支持 `Table`、`call_indirect`、控制流与完整 `i32`/`i64` 操作码的 WASM 编码器 |
+| `src/dbt-runtime.js` | 端侧 AArch64→WASM 动态二进制翻译器 + WASM 内部调度循环（4096 项 Direct-Mapped I-Cache + `call_indirect`），覆盖 `CSEL`/`UDIV`/`SDIV`/`SBFM`/`UBFM`/`BFM`/逻辑立即数/`ADD`/`SUB` 扩展寄存器/`LDUR`/`STUR`/前后变址/`MRS`/`MSR TPIDR_EL0`/`LDXR`/`STXR` 及 `resetForExec()` |
+| `src/vfs-memfs.js` | 零依赖 POSIX 内存文件系统，支持目录树、ELF 二进制挂载及 AArch64 Linux ABI `struct stat`（128 字节）与 `linux_dirent64` |
+| `src/vmm-syscalls.js` | 紧凑 32 位 `brk`/`mmap`/`munmap`、Linux AArch64 初始栈构造（`argc`/`argv`/`envp`/`auxv`）、可挂起异步 syscall 状态机（`-2`）以及 `clone`/`pipe2`/`dup3`/`execve`/`wait4`/`openat`/`fstat`/`newfstatat`/`getdents64`/`writev`/`uname` |
+| `ios-bridge/guest-v2.js` | `WKWebView` 运行时入口，支持 `mountBase64File` 预装 `/bin` 工具与异步 Swift PTY 桥接 |
+| `ios-bridge/WasmGuestBridgeV2.swift` | 升级版 Swift `WKWebView` 宿主（支持 `mountFile`、`argv`/`envp` 传参、异步 `reqId` 回调、`iterminal-host://` COOP/COEP 协议处理与 Jetsam 终止恢复） |
+| `tests/test_suite.js` | 自包含 AArch64 汇编器 + ELF64 构造器 + 8 项端到端测试与性能基准 |
 
-## 线性内存布局
-
-```text
-0x0000_0000 - 0x0000_0FFF  CPU 状态页 (x0..x30, SP, PC, N/Z/C/V, TPIDR_EL0)
-0x0000_1000 - 0x0000_8FFF  Direct-Mapped I-Cache (4096 项 x 8B: { tag_pc, tbl_idx })
-0x0001_0000 - 0x001F_EFFF  ELF PT_LOAD 代码/数据段 + brk 堆区
-0x001F_F000 (向下增长)       Guest 栈空间
-0x0020_0000 - 0x7FFF_FFFF  Compact 32-bit mmap 匿名映射区（按需自动 grow WASM 内存）
-```
-
-## 本地验证
-
-在 Node.js 18+ 环境下直接运行：
+## 本地运行与验证
 
 ```bash
-node tests/test_suite.js
+tar -xzf iTerminal-wasm-jit-v2.1.tar.gz -C .
+node wasm-jit-v2/tests/test_suite.js
 ```
 
-预期验证项：
-1. **Tight Loop 性能对比**：20 万次循环下，WASM 内部调度循环（`stepWasmLoop`）对比原版 JS 逐块调度（`stepJSPerBlock`）实测加速 **~10x**。
-2. **间接跳转与端侧懒翻译**：运行时通过 `ADR` + `BLR` + `RET` 跳转至未预翻译函数，验证按需编译并写入 `WebAssembly.Table` + I-Cache。
-3. **紧凑 32 位 VMM**：验证 `brk` 扩堆、`mmap` 匿名页分配、跨页读写与 `munmap` 回收。
-4. **可挂起异步 Syscall**：模拟异步 Swift PTY `read(0, ...)` 返回 `-2` 挂起、Promise 就绪后写入 `x0` 并从 `nextPC` 无缝恢复。
-5. **多进程 `fork` + `pipe2` + `wait4`**：在极小时间片（`sliceBudget = 8`）交错调度下，子进程写管道后以退出码 `42` 退出，父进程阻塞读取并成功回收。
-
-## 下一步接入现有仓库建议
-
-1. 将原仓库 `src/syscalls.js` 中的 `openat`/`fstat`/`getdents64`/`memfs.js` 适配器接入 `GuestKernel._handleSyscall`，即可同时具备完整文件系统与多进程/异步 I/O 能力。
-2. 针对 `musl` 静态编译版 BusyBox 补齐剩余 AArch64 指令（`SBFM`/`UBFM`/`CSEL`/`UDIV`/`SDIV`/`LDXR`/`STXR`）和 `execve`（重载 ELF + 刷新 I-Cache）。
+8 项端到端验证：
+1. **Tight Loop 基准**：20 万次循环下 WASM 内部调度循环较 JS 逐块调度加速约 **10x**。
+2. **间接跳转懒翻译**：`ADR` + `BLR` + `RET` 运行时按需翻译并写入 I-Cache。
+3. **紧凑 32 位 VMM**：`brk`/`mmap`/`munmap` 跨页读写与回收。
+4. **可挂起异步 Syscall**：模拟异步 Swift PTY `read(0, ...)` 挂起与无损恢复。
+5. **多进程管道**：`fork` + `pipe2` + `wait4` 在小时间片交错调度下通信与回收。
+6. **Musl 关键指令**：验证 `UDIV`/`SDIV`/`CSEL`/`UBFM`/`SBFM`/`TPIDR_EL0`/`LDXR`+`STXR`/`LDUR`+`STUR`。
+7. **VFS 与 Linux `argv` ABI**：从初始栈读取 `argc`/`argv[1]`，通过 `openat`/`read`/`write` 输出 `/etc/hostname`。
+8. **完整 Shell 管道**：`/bin/sh` 执行 `fork` + `pipe2` + `dup3(wfd, 1)` + `execve("/bin/echo", ...)` + `wait4`，跨两个独立 ELF64 二进制完成管道捕获与子进程回收。

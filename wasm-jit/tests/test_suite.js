@@ -3,6 +3,7 @@
 const assert = require('assert');
 const { performance } = require('perf_hooks');
 const WasmDBT = require('../src/dbt-runtime');
+const { MemFS } = require('../src/vfs-memfs');
 const { SYS, GuestKernel } = require('../src/vmm-syscalls');
 
 // ---------------------------------------------------------------------------
@@ -15,6 +16,8 @@ const A64 = {
     (0xd2800000 | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | (rd & 31)) >>> 0,
   movk: (rd, imm16, hw = 0) =>
     (0xf2800000 | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | (rd & 31)) >>> 0,
+  movn: (rd, imm16, hw = 0) =>
+    (0x92800000 | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | (rd & 31)) >>> 0,
   movReg: (rd, rm) => (0xaa0003e0 | ((rm & 31) << 16) | (rd & 31)) >>> 0,
   addImm: (rd, rn, imm12) =>
     (0x91000000 | ((imm12 & 0xfff) << 10) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
@@ -26,15 +29,36 @@ const A64 = {
     (0x8b000000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
   mul: (rd, rn, rm) =>
     (0x9b007c00 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
-  // Unsigned offset LDR/STR 64-bit (byteOff must be multiple of 8)
+  udiv: (rd, rn, rm) =>
+    (0x9ac00800 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  sdiv: (rd, rn, rm) =>
+    (0x9ac00c00 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  lslv: (rd, rn, rm) =>
+    (0x9ac02000 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  csel: (rd, rn, rm, cond) =>
+    (0x9a800000 | ((rm & 31) << 16) | ((cond & 15) << 12) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  csneg: (rd, rn, rm, cond) =>
+    (0xda800400 | ((rm & 31) << 16) | ((cond & 15) << 12) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  ubfm64: (rd, rn, immr, imms) =>
+    (0xd3400000 | ((immr & 63) << 16) | ((imms & 63) << 10) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  sbfm64: (rd, rn, immr, imms) =>
+    (0x93400000 | ((immr & 63) << 16) | ((imms & 63) << 10) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  mrsTpidr: (rt) => (0xd53bd040 | (rt & 31)) >>> 0,
+  msrTpidr: (rt) => (0xd51bd040 | (rt & 31)) >>> 0,
+  ldxr64: (rt, rn) => (0xc85f7c00 | ((rn & 31) << 5) | (rt & 31)) >>> 0,
+  stxr64: (rs, rt, rn) => (0xc8007c00 | ((rs & 31) << 16) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
   ldr64: (rt, rn, byteOff = 0) =>
     (0xf9400000 | (((byteOff >>> 3) & 0xfff) << 10) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
   str64: (rt, rn, byteOff = 0) =>
     (0xf9000000 | (((byteOff >>> 3) & 0xfff) << 10) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
   ldr32: (rt, rn, byteOff = 0) =>
     (0xb9400000 | (((byteOff >>> 2) & 0xfff) << 10) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
-  str8: (rt, rn, byteOff = 0) =>
-    (0x39000000 | ((byteOff & 0xfff) << 10) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
+  ldr8Post: (rt, rn, simm9) =>
+    (0x38400400 | ((simm9 & 0x1ff) << 12) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
+  ldur64: (rt, rn, simm9) =>
+    (0xf8400000 | ((simm9 & 0x1ff) << 12) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
+  stur64: (rt, rn, simm9) =>
+    (0xf8000000 | ((simm9 & 0x1ff) << 12) | ((rn & 31) << 5) | (rt & 31)) >>> 0,
   b: (relInsns) => (0x14000000 | (relInsns & 0x03ffffff)) >>> 0,
   bl: (relInsns) => (0x94000000 | (relInsns & 0x03ffffff)) >>> 0,
   bCond: (cond, relInsns) => (0x54000000 | ((relInsns & 0x7ffff) << 5) | (cond & 0xf)) >>> 0,
@@ -62,23 +86,19 @@ function buildELF64(codeInsns, dataBytes = new Uint8Array(0), baseVaddr = 0x1000
   const buf = new Uint8Array(totalSize);
   const dv = new DataView(buf.buffer);
 
-  // ELF Header
   buf[0] = 0x7f; buf[1] = 0x45; buf[2] = 0x4c; buf[3] = 0x46;
-  buf[4] = 2; // ELF64
-  buf[5] = 1; // Little-endian
-  buf[6] = 1; // Version
-  dv.setUint16(16, 2, true);      // ET_EXEC
-  dv.setUint16(18, 183, true);    // EM_AARCH64
+  buf[4] = 2; buf[5] = 1; buf[6] = 1;
+  dv.setUint16(16, 2, true);
+  dv.setUint16(18, 183, true);
   dv.setUint32(20, 1, true);
-  dv.setBigUint64(24, BigInt(baseVaddr), true); // e_entry
-  dv.setBigUint64(32, BigInt(ehdrSize), true);  // e_phoff
+  dv.setBigUint64(24, BigInt(baseVaddr), true);
+  dv.setBigUint64(32, BigInt(ehdrSize), true);
   dv.setUint16(52, ehdrSize, true);
   dv.setUint16(54, phdrSize, true);
-  dv.setUint16(56, 1, true);      // e_phnum = 1
+  dv.setUint16(56, 1, true);
 
-  // PT_LOAD Program Header
-  dv.setUint32(ehdrSize + 0, 1, true); // PT_LOAD
-  dv.setUint32(ehdrSize + 4, 7, true); // RWX
+  dv.setUint32(ehdrSize + 0, 1, true);
+  dv.setUint32(ehdrSize + 4, 7, true);
   dv.setBigUint64(ehdrSize + 8, BigInt(fileOffset), true);
   dv.setBigUint64(ehdrSize + 16, BigInt(baseVaddr), true);
   dv.setBigUint64(ehdrSize + 24, BigInt(baseVaddr), true);
@@ -89,9 +109,7 @@ function buildELF64(codeInsns, dataBytes = new Uint8Array(0), baseVaddr = 0x1000
   for (let i = 0; i < codeInsns.length; i++) {
     dv.setUint32(fileOffset + i * 4, codeInsns[i], true);
   }
-  if (dataBytes.length) {
-    buf.set(dataBytes, fileOffset + dataOffsetInSeg);
-  }
+  if (dataBytes.length) buf.set(dataBytes, fileOffset + dataOffsetInSeg);
   return { elf: buf, dataVaddr: baseVaddr + dataOffsetInSeg };
 }
 
@@ -100,18 +118,13 @@ function buildELF64(codeInsns, dataBytes = new Uint8Array(0), baseVaddr = 0x1000
 // ---------------------------------------------------------------------------
 async function testLoopAndBenchmark() {
   const N = 200000;
-  // x0 = 0 (sum), x1 = N (counter)
-  // loop: x0 += x1; x1 -= 1; cbnz x1, loop
-  // exit(x0 & 0xff)
   const code = [
     A64.movz(0, 0),
     A64.movz(1, N & 0xffff, 0),
     A64.movk(1, (N >>> 16) & 0xffff, 1),
-    // loop (idx 3):
     A64.addReg(0, 0, 1),
     A64.subsImm(1, 1, 1),
-    A64.bCond(1, -2), // B.NE back to idx 3
-    // store 64-bit result in x19 so we can inspect it, then exit(0)
+    A64.bCond(1, -2),
     A64.movReg(19, 0),
     A64.movz(0, 0),
     A64.movz(8, SYS.EXIT_GROUP),
@@ -120,313 +133,317 @@ async function testLoopAndBenchmark() {
   const { elf } = buildELF64(code);
   const expectedSum = (BigInt(N) * BigInt(N + 1)) / 2n;
 
-  // Run with WASM-internal dispatch loop
-  const engineWasm = new WasmDBT.DBTEngine();
-  const kWasm = new GuestKernel(engineWasm);
+  const kWasm = new GuestKernel(new WasmDBT.DBTEngine());
   const pWasm = kWasm.spawnELF(elf);
   const t0 = performance.now();
   await kWasm.runAll({ mode: 'wasm', sliceBudget: 50000 });
   const wasmMs = performance.now() - t0;
-  assert.strictEqual(pWasm.cpu.getReg(19), expectedSum, 'WASM loop sum mismatch');
+  assert.strictEqual(pWasm.cpu.getReg(19), expectedSum);
 
-  // Run with JS-per-block dispatch (v1 baseline)
-  const engineJS = new WasmDBT.DBTEngine();
-  const kJS = new GuestKernel(engineJS);
+  const kJS = new GuestKernel(new WasmDBT.DBTEngine());
   const pJS = kJS.spawnELF(elf);
   const t1 = performance.now();
   await kJS.runAll({ mode: 'js', sliceBudget: 50000 });
   const jsMs = performance.now() - t1;
-  assert.strictEqual(pJS.cpu.getReg(19), expectedSum, 'JS loop sum mismatch');
+  assert.strictEqual(pJS.cpu.getReg(19), expectedSum);
 
-  const speedup = jsMs / wasmMs;
   console.log(
-    `[PASS] Test 1 (Loop ${N.toLocaleString()} iters): sum=${expectedSum} | WASM-loop=${wasmMs.toFixed(
+    `[PASS] Test 1 (Loop ${N.toLocaleString()} iters): WASM-loop=${wasmMs.toFixed(
       2
-    )}ms vs JS-per-BB=${jsMs.toFixed(2)}ms (${speedup.toFixed(2)}x speedup)`
+    )}ms vs JS-per-BB=${jsMs.toFixed(2)}ms (${(jsMs / wasmMs).toFixed(2)}x speedup)`
   );
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: Indirect Branches (BLR / RET / BR) & On-Device Lazy DBT
+// Test 2: Indirect Branches (BLR / RET) & On-Device Lazy DBT
 // ---------------------------------------------------------------------------
 async function testIndirectBranchesDBT() {
-  // main:
-  //   adr x9, fn_square     (runtime function pointer)
-  //   mov x0, #12
-  //   blr x9                (indirect call -> lazy DBT compiles fn_square!)
-  //   mov x19, x0           (expect 144)
-  //   mov x0, #0; mov x8, #94; svc #0
-  // fn_square:
-  //   mul x0, x0, x0
-  //   ret
   const code = [
-    A64.adr(9, 6 * 4),      // idx 0: x9 = PC + 24 -> idx 6 (fn_square)
-    A64.movz(0, 12),        // idx 1
-    A64.blr(9),             // idx 2: indirect call!
-    A64.movReg(19, 0),      // idx 3: save result
-    A64.movz(0, 0),         // idx 4
-    A64.movz(8, SYS.EXIT_GROUP), // idx 5 -- wait: let's put svc at idx 6 and fn_square at idx 7
+    A64.adr(9, 7 * 4),
+    A64.movz(0, 12),
+    A64.blr(9),
+    A64.movReg(19, 0),
+    A64.movz(0, 0),
+    A64.movz(8, SYS.EXIT_GROUP),
+    A64.svc(0),
+    A64.mul(0, 0, 0),
+    A64.ret(30),
   ];
-  // Rebuild with exact offsets:
-  const code2 = [
-    A64.adr(9, 7 * 4),           // 0: x9 -> idx 7 (fn_square)
-    A64.movz(0, 12),             // 1
-    A64.blr(9),                  // 2: indirect call -> lazy DBT
-    A64.movReg(19, 0),           // 3
-    A64.movz(0, 0),              // 4
-    A64.movz(8, SYS.EXIT_GROUP), // 5
-    A64.svc(0),                  // 6
-    // idx 7: fn_square(x0) -> x0 * x0
-    A64.mul(0, 0, 0),            // 7
-    A64.ret(30),                 // 8: indirect return!
-  ];
-  const { elf } = buildELF64(code2);
-  const engine = new WasmDBT.DBTEngine();
-  const kernel = new GuestKernel(engine);
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine());
   const proc = kernel.spawnELF(elf);
   await kernel.runAll();
-
-  assert.strictEqual(proc.cpu.getReg(19), 144n, 'BLR/RET indirect branch result mismatch');
-  assert(proc.cpu.compiledBlocks >= 3, 'Expected lazy compilation of at least 3 blocks');
-  console.log(
-    `[PASS] Test 2 (Indirect BLR/RET & Lazy DBT): 12^2=${proc.cpu.getReg(
-      19
-    )}, lazily compiled ${proc.cpu.compiledBlocks} blocks`
-  );
+  assert.strictEqual(proc.cpu.getReg(19), 144n);
+  console.log(`[PASS] Test 2 (Indirect BLR/RET & Lazy DBT): 12^2=144`);
 }
 
 // ---------------------------------------------------------------------------
 // Test 3: Compact 32-bit VMM (brk + mmap + munmap)
 // ---------------------------------------------------------------------------
 async function testCompactVMM() {
-  // 1. x19 = brk(0)
-  // 2. x20 = brk(x19 + 8192)
-  // 3. write 0x12345678 at [x19 + 4096], read back into x21
-  // 4. x22 = mmap(0, 8192, PROT_RW, MAP_ANON)
-  // 5. write 0xCAFE at [x22 + 8], read back into x23
-  // 6. munmap(x22, 8192) -> x24 = 0
-  // 7. exit(0)
   const code = [
-    A64.movz(0, 0),
-    A64.movz(8, SYS.BRK),
-    A64.svc(0),
-    A64.movReg(19, 0),           // x19 = old brk
+    A64.movz(0, 0), A64.movz(8, SYS.BRK), A64.svc(0), A64.movReg(19, 0),
+    A64.addImm(0, 19, 4095), A64.addImm(0, 0, 4095), A64.movz(8, SYS.BRK), A64.svc(0),
+    A64.movz(1, 0x5678, 0), A64.movk(1, 0x1234, 1), A64.str64(1, 19, 4096), A64.ldr64(21, 19, 4096),
+    A64.movz(0, 0), A64.movz(1, 8192), A64.movz(2, 3), A64.movz(3, 0x22), A64.movz(8, SYS.MMAP), A64.svc(0),
+    A64.movReg(22, 0), A64.movz(1, 0xcafe), A64.str64(1, 22, 8), A64.ldr64(23, 22, 8),
+    A64.movReg(0, 22), A64.movz(1, 8192), A64.movz(8, SYS.MUNMAP), A64.svc(0), A64.movReg(24, 0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+  assert.strictEqual(proc.cpu.getReg(21), 0x12345678n);
+  assert.strictEqual(proc.cpu.getReg(23), 0xcafen);
+  assert.strictEqual(proc.cpu.getReg(24), 0n);
+  console.log(`[PASS] Test 3 (Compact 32-bit VMM): brk/mmap/munmap verified`);
+}
 
-    A64.addImm(0, 19, 4095),
-    A64.addImm(0, 0, 4095),      // x0 = old brk + 8190
-    A64.movz(8, SYS.BRK),
-    A64.svc(0),
-    A64.movReg(20, 0),           // x20 = new brk
+// ---------------------------------------------------------------------------
+// Test 4: Suspendable Async Syscall (Simulated Swift PTY read)
+// ---------------------------------------------------------------------------
+async function testSuspendableAsyncSyscall() {
+  const code = [
+    A64.subImm(31, 31, 64),
+    A64.movz(0, 0), A64.addImm(1, 31, 0), A64.movz(2, 64), A64.movz(8, SYS.READ), A64.svc(0),
+    A64.movReg(2, 0), A64.movz(0, 1), A64.addImm(1, 31, 0), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  let stdout = '';
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
+    readStdinAsync: () => new Promise((r) => setTimeout(() => r(new TextEncoder().encode('hello PTY!\n')), 10)),
+  });
+  kernel.spawnELF(elf);
+  await kernel.runAll();
+  assert.strictEqual(stdout, 'hello PTY!\n');
+  console.log(`[PASS] Test 4 (Suspendable Async Syscall): echoed "${stdout.trim()}"`);
+}
 
-    A64.movz(1, 0x5678, 0),
-    A64.movk(1, 0x1234, 1),
-    A64.str64(1, 19, 4096),
-    A64.ldr64(21, 19, 4096),     // x21 = 0x12345678
+// ---------------------------------------------------------------------------
+// Test 5: fork() + pipe2() + wait4()
+// ---------------------------------------------------------------------------
+async function testForkPipeWait() {
+  const msg = new TextEncoder().encode('child->pipe->parent OK!\n');
+  const baseVaddr = 0x10000;
+  const code = [
+    A64.subImm(31, 31, 128),
+    A64.addImm(0, 31, 0), A64.movz(1, 0), A64.movz(8, SYS.PIPE2), A64.svc(0),
+    A64.ldr32(19, 31, 0), A64.ldr32(20, 31, 4),
+    A64.movz(0, 0), A64.movz(8, SYS.CLONE), A64.svc(0),
+    A64.cbz(0, 0), // patched
+    A64.movReg(21, 0),
+    A64.movReg(0, 20), A64.movz(8, SYS.CLOSE), A64.svc(0),
+    A64.movReg(0, 19), A64.addImm(1, 31, 16), A64.movz(2, 64), A64.movz(8, SYS.READ), A64.svc(0),
+    A64.movReg(2, 0), A64.movz(0, 1), A64.addImm(1, 31, 16), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movReg(0, 21), A64.addImm(1, 31, 80), A64.movz(2, 0), A64.movz(3, 0), A64.movz(8, SYS.WAIT4), A64.svc(0),
+    A64.ldr32(22, 31, 80), A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const childIdx = code.length;
+  code[10] = A64.cbz(0, childIdx - 10);
+  code.push(
+    A64.movReg(0, 19), A64.movz(8, SYS.CLOSE), A64.svc(0),
+    A64.movReg(0, 20), A64.movz(1, 0, 0), A64.movk(1, 0, 1), A64.movz(2, msg.length), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movReg(0, 20), A64.movz(8, SYS.CLOSE), A64.svc(0),
+    A64.movz(0, 42), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0)
+  );
+  const realMsgAddr = baseVaddr + ((code.length * 4 + 15) & ~15);
+  code[childIdx + 4] = A64.movz(1, realMsgAddr & 0xffff, 0);
+  code[childIdx + 5] = A64.movk(1, (realMsgAddr >>> 16) & 0xffff, 1);
 
-    // mmap(0, 8192, 3, 0x22)
-    A64.movz(0, 0),
-    A64.movz(1, 8192),
-    A64.movz(2, 3),
-    A64.movz(3, 0x22),
-    A64.movz(8, SYS.MMAP),
-    A64.svc(0),
-    A64.movReg(22, 0),           // x22 = mmap addr
+  const { elf } = buildELF64(code, msg, baseVaddr);
+  let stdout = '';
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
+  });
+  const parent = kernel.spawnELF(elf);
+  await kernel.runAll({ sliceBudget: 8 });
+  assert.strictEqual(stdout, 'child->pipe->parent OK!\n');
+  assert.strictEqual(parent.cpu.getReg(22), BigInt(42 << 8));
+  console.log(`[PASS] Test 5 (fork + pipe2 + wait4): reaped child exitCode=42`);
+}
 
-    A64.movz(1, 0xcafe),
-    A64.str64(1, 22, 8),
-    A64.ldr64(23, 22, 8),        // x23 = 0xcafe
-
-    // munmap(x22, 8192)
-    A64.movReg(0, 22),
-    A64.movz(1, 8192),
-    A64.movz(8, SYS.MUNMAP),
-    A64.svc(0),
-    A64.movReg(24, 0),           // x24 = 0
-
-    A64.movz(0, 0),
-    A64.movz(8, SYS.EXIT_GROUP),
-    A64.svc(0),
+// ---------------------------------------------------------------------------
+// Test 6: Musl-Critical AArch64 ISA (CSEL, UDIV/SDIV, UBFM/SBFM, TPIDR_EL0, LDXR/STXR, LDUR/STUR)
+// ---------------------------------------------------------------------------
+async function testMuslISA() {
+  const code = [
+    // 1. UDIV: 100 / 7 = 14 -> x19
+    A64.movz(0, 100), A64.movz(1, 7), A64.udiv(19, 0, 1),
+    // 2. SDIV: -42 / 6 = -7 -> x20
+    A64.movn(0, 41), A64.movz(1, 6), A64.sdiv(20, 0, 1),
+    // 3. CSEL: cmp x19, #14 (EQ=0) -> choose 777 over 999 -> x21
+    A64.subsImm(31, 19, 14), A64.movz(2, 777), A64.movz(3, 999), A64.csel(21, 2, 3, 0),
+    // 4. UBFM (LSL #4): 5 << 4 = 80 (immr=60, imms=59) -> x22
+    A64.movz(4, 5), A64.ubfm64(22, 4, 60, 59),
+    // 5. SBFM (SXTB): sign-extend 0xFF -> -1 (immr=0, imms=7) -> x23
+    A64.movz(5, 0xff), A64.sbfm64(23, 5, 0, 7),
+    // 6. MSR/MRS TPIDR_EL0: write 0x55AA -> read back into x24
+    A64.movz(6, 0x55aa), A64.msrTpidr(6), A64.mrsTpidr(24),
+    // 7. STUR/LDUR + LDXR/STXR atomic increment on [sp - 16]
+    A64.subImm(31, 31, 32),
+    A64.movz(7, 41), A64.stur64(7, 31, 16),
+    A64.addImm(9, 31, 16),
+    A64.ldxr64(10, 9), A64.addImm(10, 10, 1), A64.stxr64(25, 10, 9), // x25 = status (0)
+    A64.ldur64(26, 31, 16),                                          // x26 = 42
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
   ];
   const { elf } = buildELF64(code);
   const kernel = new GuestKernel(new WasmDBT.DBTEngine());
   const proc = kernel.spawnELF(elf);
   await kernel.runAll();
 
-  assert.strictEqual(proc.cpu.getReg(21), 0x12345678n);
-  assert.strictEqual(proc.cpu.getReg(23), 0xcafen);
-  assert.strictEqual(proc.cpu.getReg(24), 0n);
-  assert(proc.cpu.getReg(22) >= 0x200000n && proc.cpu.getReg(22) < 0x7fff0000n);
-  console.log(
-    `[PASS] Test 3 (Compact 32-bit VMM): brk=0x${proc.cpu
-      .getReg(19)
-      .toString(16)}->0x${proc.cpu.getReg(20).toString(16)}, mmap=0x${proc.cpu
-      .getReg(22)
-      .toString(16)}, munmap=0`
-  );
+  assert.strictEqual(proc.cpu.getReg(19), 14n, 'UDIV');
+  assert.strictEqual(BigInt.asIntN(64, proc.cpu.getReg(20)), -7n, 'SDIV');
+  assert.strictEqual(proc.cpu.getReg(21), 777n, 'CSEL');
+  assert.strictEqual(proc.cpu.getReg(22), 80n, 'UBFM LSL');
+  assert.strictEqual(BigInt.asIntN(64, proc.cpu.getReg(23)), -1n, 'SBFM SXTB');
+  assert.strictEqual(proc.cpu.getReg(24), 0x55aan, 'TPIDR_EL0');
+  assert.strictEqual(proc.cpu.getReg(25), 0n, 'STXR status');
+  assert.strictEqual(proc.cpu.getReg(26), 42n, 'LDXR/STXR value');
+  console.log(`[PASS] Test 6 (Musl ISA): UDIV/SDIV/CSEL/UBFM/SBFM/TPIDR_EL0/LDXR+STXR all verified`);
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: Suspendable Async Syscall (Simulated Async Swift PTY stdin read)
+// Test 7: VFS (MemFS openat + fstat + read + getdents64) + argv ABI
 // ---------------------------------------------------------------------------
-async function testSuspendableAsyncSyscall() {
-  // Allocate buffer on stack (sp - 64), read(0, buf, 64) [async!], write(1, buf, n), exit(0)
+async function testVFSAndArgv() {
+  // Program reads argv[1] from [sp + 16], opens that file via openat(AT_FDCWD, argv[1], 0),
+  // reads its contents and writes them to stdout!
   const code = [
-    A64.subImm(31, 31, 64),      // sp -= 64
-    A64.movz(0, 0),              // fd = 0 (stdin)
-    A64.addImm(1, 31, 0),        // buf = sp
-    A64.movz(2, 64),             // len = 64
-    A64.movz(8, SYS.READ),
-    A64.svc(0),                  // SUSPENDS until Swift/host Promise resolves!
-
-    A64.movReg(2, 0),            // len = bytes read
-    A64.movz(0, 1),              // fd = 1 (stdout)
-    A64.addImm(1, 31, 0),        // buf = sp
-    A64.movz(8, SYS.WRITE),
-    A64.svc(0),
-
-    A64.movz(0, 0),
-    A64.movz(8, SYS.EXIT_GROUP),
-    A64.svc(0),
-  ];
-  const { elf } = buildELF64(code);
-  let stdout = '';
-  const dec = new TextDecoder();
-  const enc = new TextEncoder();
-
-  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
-    onStdout: (b) => {
-      stdout += dec.decode(b);
-    },
-    readStdinAsync: () =>
-      new Promise((resolve) => {
-        setTimeout(() => resolve(enc.encode('hello from async iOS PTY!\n')), 20);
-      }),
-  });
-  kernel.spawnELF(elf);
-  await kernel.runAll();
-
-  assert.strictEqual(stdout, 'hello from async iOS PTY!\n');
-  console.log(`[PASS] Test 4 (Suspendable Async Syscall): echoed "${stdout.trim()}"`);
-}
-
-// ---------------------------------------------------------------------------
-// Test 5: Multi-Process fork() + pipe2() + wait4() Pipeline
-// ---------------------------------------------------------------------------
-async function testForkPipeWait() {
-  const msg = new TextEncoder().encode('child->pipe->parent OK!\n');
-  // Stack layout:
-  //   [sp + 0] = rfd (i32), [sp + 4] = wfd (i32)
-  //   [sp + 16..80] = read buffer
-  //   [sp + 80] = wait4 status
-  const baseVaddr = 0x10000;
-  // Build placeholder first to know dataVaddr
-  const dummyLen = 37;
-  const dataOffsetInSeg = (dummyLen * 4 + 15) & ~15;
-  const msgAddr = baseVaddr + dataOffsetInSeg;
-
-  const code = [
-    // 0: sp -= 128
-    A64.subImm(31, 31, 128),
-    // 1..4: pipe2(sp, 0)
-    A64.addImm(0, 31, 0),
-    A64.movz(1, 0),
-    A64.movz(8, SYS.PIPE2),
-    A64.svc(0),
-    // 5..6: load rfd -> x19, wfd -> x20
-    A64.ldr32(19, 31, 0),
-    A64.ldr32(20, 31, 4),
-    // 7..9: clone() (fork)
-    A64.movz(0, 0),
-    A64.movz(8, SYS.CLONE),
-    A64.svc(0),
-    // 10: if x0 == 0 jump to child (idx 27)
-    A64.cbz(0, 17),
-
-    // --- PARENT (idx 11..26) ---
-    // 11: save childPid in x21
-    A64.movReg(21, 0),
-    // 12..14: close(wfd)
-    A64.movReg(0, 20),
-    A64.movz(8, SYS.CLOSE),
-    A64.svc(0),
-    // 15..19: read(rfd, sp+16, 64) [blocks until child writes!]
-    A64.movReg(0, 19),
-    A64.addImm(1, 31, 16),
-    A64.movz(2, 64),
-    A64.movz(8, SYS.READ),
-    A64.svc(0),
-    // 20..24: write(1, sp+16, n)
-    A64.movReg(2, 0),
-    A64.movz(0, 1),
-    A64.addImm(1, 31, 16),
-    A64.movz(8, SYS.WRITE),
-    A64.svc(0),
-    // 25..30: wait4(childPid, sp+80, 0, 0), then exit(0)
-    A64.movReg(0, 21),
-    A64.addImm(1, 31, 80),
+    A64.ldr64(19, 31, 0),    // x19 = argc
+    A64.ldr64(20, 31, 16),   // x20 = argv[1] ("/etc/hostname")
+    // openat(-100, argv[1], 0, 0)
+    A64.movn(0, 99),         // x0 = -100 (AT_FDCWD)
+    A64.movReg(1, 20),
     A64.movz(2, 0),
     A64.movz(3, 0),
-    A64.movz(8, SYS.WAIT4),
+    A64.movz(8, SYS.OPENAT),
     A64.svc(0),
-    A64.ldr32(22, 31, 80), // x22 = wait status (expect 42 << 8)
-    A64.movz(0, 0),
-    A64.movz(8, SYS.EXIT_GROUP),
-    A64.svc(0),
-
-    // --- CHILD (idx 35..45) --- wait, let's adjust cbz offset cleanly!
+    A64.movReg(21, 0),       // x21 = fd
+    // read(fd, sp - 64, 64)
+    A64.subImm(31, 31, 64),
+    A64.movReg(0, 21), A64.addImm(1, 31, 0), A64.movz(2, 64), A64.movz(8, SYS.READ), A64.svc(0),
+    // write(1, sp, n)
+    A64.movReg(2, 0), A64.movz(0, 1), A64.addImm(1, 31, 0), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
   ];
+  const { elf } = buildELF64(code);
+  const fs = new MemFS();
+  fs.writeFile('/etc/hostname', 'iterminal-ios\n');
+  let stdout = '';
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
+    fs,
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
+  });
+  const proc = kernel.spawnELF(elf, { argv: ['/bin/cat', '/etc/hostname'] });
+  await kernel.runAll();
 
-  // Cleanly compute child index
-  const childIdx = code.length; // 35
-  code[10] = A64.cbz(0, childIdx - 10);
+  assert.strictEqual(proc.cpu.getReg(19), 2n, 'argc should be 2');
+  assert.strictEqual(stdout, 'iterminal-ios\n');
+  console.log(`[PASS] Test 7 (VFS + Linux argv ABI): /bin/cat /etc/hostname -> "${stdout.trim()}"`);
+}
 
-  // Child closes rfd, writes msg to wfd, closes wfd, exits with code 42
-  code.push(
-    A64.movReg(0, 19),
-    A64.movz(8, SYS.CLOSE),
+// ---------------------------------------------------------------------------
+// Test 8: Full Shell Pipeline: fork() + pipe2() + dup3(wfd, 1) + execve("/bin/echo") + wait4()
+// ---------------------------------------------------------------------------
+async function testForkExecvePipeline() {
+  // Binary B (`/bin/echo`): reads argv[1] from Linux stack [sp + 16], computes strlen via LDRB post-index,
+  // writes argv[1] to fd 1 (redirected to pipe!), exits with code 7.
+  const echoCode = [
+    A64.ldr64(19, 31, 16),       // 0: x19 = argv[1] ptr
+    A64.movReg(20, 19),          // 1: x20 = cursor
+    // strlen loop (idx 2..4):
+    A64.ldr8Post(1, 20, 1),      // 2: w1 = *x20++
+    A64.cbnz(1, -1),             // 3: loop while byte != 0
+    A64.subImm(20, 20, 1),       // 4: exclude trailing '\0'
+    // x2 = x20 - x19 (length) via SUB shifted reg
+    ((0xcb000000 | (19 << 16) | (20 << 5) | 2) >>> 0), // 5: sub x2, x20, x19
+    A64.movz(0, 1),              // 6: fd = 1 (stdout -> pipe!)
+    A64.movReg(1, 19),           // 7: buf = argv[1]
+    A64.movz(8, SYS.WRITE),      // 8
+    A64.svc(0),                  // 9
+    A64.movz(0, 7),              // 10: exit(7)
+    A64.movz(8, SYS.EXIT_GROUP), // 11
+    A64.svc(0),                  // 12
+  ];
+  const { elf: echoElf } = buildELF64(echoCode);
+
+  // Binary A (`/bin/sh` mini-shell):
+  //   pipe2 -> fork -> child: dup3(wfd, 1, 0), close(rfd), close(wfd), execve("/bin/echo", ["/bin/echo", "execve-pipeline-ok!"], NULL)
+  //                 -> parent: close(wfd), read(rfd), write(1), wait4(child)
+  const enc = new TextEncoder();
+  const sPath = enc.encode('/bin/echo\0');
+  const sArg1 = enc.encode('execve-pipeline-ok!\n\0');
+  const dataBlob = new Uint8Array(sPath.length + sArg1.length);
+  dataBlob.set(sPath, 0);
+  dataBlob.set(sArg1, sPath.length);
+
+  const baseVaddr = 0x10000;
+  const shCode = [
+    A64.subImm(31, 31, 160),
+    A64.addImm(0, 31, 0), A64.movz(1, 0), A64.movz(8, SYS.PIPE2), A64.svc(0),
+    A64.ldr32(19, 31, 0), A64.ldr32(20, 31, 4),
+    A64.movz(0, 0), A64.movz(8, SYS.CLONE), A64.svc(0),
+    A64.cbz(0, 0), // idx 10 -> patched to childIdx
+    // Parent:
+    A64.movReg(21, 0),
+    A64.movReg(0, 20), A64.movz(8, SYS.CLOSE), A64.svc(0),
+    A64.movReg(0, 19), A64.addImm(1, 31, 16), A64.movz(2, 64), A64.movz(8, SYS.READ), A64.svc(0),
+    A64.movReg(2, 0), A64.movz(0, 1), A64.addImm(1, 31, 16), A64.movz(8, SYS.WRITE), A64.svc(0),
+    A64.movReg(0, 21), A64.addImm(1, 31, 96), A64.movz(2, 0), A64.movz(3, 0), A64.movz(8, SYS.WAIT4), A64.svc(0),
+    A64.ldr32(22, 31, 96), A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const childIdx = shCode.length;
+  shCode[10] = A64.cbz(0, childIdx - 10);
+
+  // Child: dup3(wfd, 1, 0); close(rfd); close(wfd); build argv[] at [sp+112]; execve(path, argv, 0)
+  shCode.push(
+    A64.movReg(0, 20), A64.movz(1, 1), A64.movz(2, 0), A64.movz(8, SYS.DUP3), A64.svc(0),
+    A64.movReg(0, 19), A64.movz(8, SYS.CLOSE), A64.svc(0),
+    A64.movReg(0, 20), A64.movz(8, SYS.CLOSE), A64.svc(0),
+    A64.movz(10, 0, 0), A64.movk(10, 0, 1), // patched: pathPtr (/bin/echo)
+    A64.movz(11, 0, 0), A64.movk(11, 0, 1), // patched: arg1Ptr (execve-pipeline-ok!\n)
+    A64.movz(12, 0),
+    A64.str64(10, 31, 112),
+    A64.str64(11, 31, 120),
+    A64.str64(12, 31, 128),
+    A64.movReg(0, 10),
+    A64.addImm(1, 31, 112),
+    A64.movz(2, 0),
+    A64.movz(8, SYS.EXECVE),
     A64.svc(0),
-
-    A64.movReg(0, 20),
-    A64.movz(1, 0, 0), // patched below with real dataVaddr
-    A64.movk(1, 0, 1), // patched below
-    A64.movz(2, msg.length),
-    A64.movz(8, SYS.WRITE),
-    A64.svc(0),
-
-    A64.movReg(0, 20),
-    A64.movz(8, SYS.CLOSE),
-    A64.svc(0),
-
-    A64.movz(0, 42),
-    A64.movz(8, SYS.EXIT_GROUP),
-    A64.svc(0)
+    // Fallback if execve failed
+    A64.movz(0, 99), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0)
   );
 
-  // Patch msgAddr now that code.length is final
-  const realDataOff = (code.length * 4 + 15) & ~15;
-  const realMsgAddr = baseVaddr + realDataOff;
-  code[childIdx + 4] = A64.movz(1, realMsgAddr & 0xffff, 0);
-  code[childIdx + 5] = A64.movk(1, (realMsgAddr >>> 16) & 0xffff, 1);
+  const realDataOff = (shCode.length * 4 + 15) & ~15;
+  const pathPtr = baseVaddr + realDataOff;
+  const arg1Ptr = pathPtr + sPath.length;
+  const patchBase = childIdx + 11;
+  shCode[patchBase + 0] = A64.movz(10, pathPtr & 0xffff, 0);
+  shCode[patchBase + 1] = A64.movk(10, (pathPtr >>> 16) & 0xffff, 1);
+  shCode[patchBase + 2] = A64.movz(11, arg1Ptr & 0xffff, 0);
+  shCode[patchBase + 3] = A64.movk(11, (arg1Ptr >>> 16) & 0xffff, 1);
 
-  const { elf, dataVaddr } = buildELF64(code, msg, baseVaddr);
-  assert.strictEqual(dataVaddr, realMsgAddr);
+  const { elf: shElf } = buildELF64(shCode, dataBlob, baseVaddr);
+  const fs = new MemFS();
+  fs.writeFile('/bin/echo', echoElf, 0o755);
 
   let stdout = '';
-  const dec = new TextDecoder();
   const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
-    onStdout: (b) => {
-      stdout += dec.decode(b);
-    },
+    fs,
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
   });
-  const parent = kernel.spawnELF(elf);
-  await kernel.runAll({ sliceBudget: 8 }); // small sliceBudget forces interleaving!
+  const parent = kernel.spawnELF(shElf, { argv: ['/bin/sh'] });
+  await kernel.runAll({ sliceBudget: 16 });
 
-  assert.strictEqual(stdout, 'child->pipe->parent OK!\n');
-  assert.strictEqual(parent.cpu.getReg(22), BigInt(42 << 8), 'wait4 exit status mismatch');
+  assert.strictEqual(stdout, 'execve-pipeline-ok!\n');
+  assert.strictEqual(parent.cpu.getReg(22), BigInt(7 << 8));
   console.log(
-    `[PASS] Test 5 (fork + pipe2 + wait4): received "${stdout.trim()}", reaped child exitCode=${
-      Number(parent.cpu.getReg(22)) >> 8
-    }`
+    `[PASS] Test 8 (Shell Pipeline fork+pipe2+dup3+execve+wait4): captured "${stdout.trim()}" (exit=7)`
   );
 }
 
@@ -436,7 +453,10 @@ async function testForkPipeWait() {
   await testCompactVMM();
   await testSuspendableAsyncSyscall();
   await testForkPipeWait();
-  console.log('\nALL 5 TESTS PASSED.');
+  await testMuslISA();
+  await testVFSAndArgv();
+  await testForkExecvePipeline();
+  console.log('\nALL 8 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

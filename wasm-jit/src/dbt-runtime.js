@@ -9,25 +9,10 @@
 
   const { VALTYPE, OP, uleb128, sleb128, ModuleBuilder } = WasmEnc;
 
-  // ---------------------------------------------------------------------------
-  // Linear Memory Layout (shared across dispatcher + all dynamically compiled blocks)
-  // 0x0000_0000 .. 0x0000_0FFF : CPU State Page (4 KB)
-  //   0x000 .. 0x0F7 : x0..x30 (31 x 8 bytes)
-  //   0x0F8          : SP      (8 bytes)
-  //   0x100          : PC      (8 bytes)
-  //   0x108          : Flag N  (i32)
-  //   0x10C          : Flag Z  (i32)
-  //   0x110          : Flag C  (i32)
-  //   0x114          : Flag V  (i32)
-  //   0x118          : TPIDR_EL0 (8 bytes)
-  // 0x0000_1000 .. 0x0000_8FFF : Direct-Mapped I-Cache (4096 entries x 8 bytes)
-  //   entry[slot] = { tag_pc: u32, tbl_idx: u32 }
-  // 0x0001_0000+               : Guest 32-bit compact virtual address space
-  // ---------------------------------------------------------------------------
   const STATE_BASE = 0x0000;
   const OFF_X = (n) => STATE_BASE + n * 8;
-  const OFF_SP = STATE_BASE + 31 * 8;      // 0x0F8
-  const OFF_PC = STATE_BASE + 32 * 8;      // 0x100
+  const OFF_SP = STATE_BASE + 31 * 8;
+  const OFF_PC = STATE_BASE + 32 * 8;
   const OFF_N = STATE_BASE + 0x108;
   const OFF_Z = STATE_BASE + 0x10c;
   const OFF_C = STATE_BASE + 0x110;
@@ -38,14 +23,13 @@
   const ICACHE_ENTRIES = 4096;
   const ICACHE_MASK = ICACHE_ENTRIES - 1;
 
-  // Execution status codes returned by basic blocks and dispatcher
   const STATUS = {
     CONTINUE: 0,
-    YIELD: 1,            // Step budget exhausted (time slice end)
-    CACHE_MISS: 2,       // Target PC not in I-Cache -> invoke on-device DBT
-    EXIT: -1,            // Guest exited via exit/exit_group
-    SYSCALL_PENDING: -2, // Blocking syscall awaiting async host Promise
-    FAULT: -3,           // Illegal instruction or unmapped PC
+    YIELD: 1,
+    CACHE_MISS: 2,
+    EXIT: -1,
+    SYSCALL_PENDING: -2,
+    FAULT: -3,
   };
 
   function signExtend(val, bits) {
@@ -53,7 +37,33 @@
     return (val << shift) >> shift;
   }
 
-  // Emit helpers
+  // ARMv8 DecodeBitMasks(immN, imms, immr, is64) -> BigInt mask
+  function decodeBitMasks(immN, imms, immr, is64) {
+    const lenVal = (immN << 6) | (~imms & 0x3f);
+    let len = 6;
+    while (len > 0 && ((lenVal >>> len) & 1) === 0) len--;
+    if (len < 1) return 0n;
+    const esize = 1 << len;
+    const levels = esize - 1;
+    const S = imms & levels;
+    const R = immr & levels;
+    const welem = (1n << BigInt(S + 1)) - 1n;
+    const esizeB = BigInt(esize);
+    const rB = BigInt(R);
+    // Rotate right within esize bits
+    const rotated =
+      rB === 0n
+        ? welem
+        : ((welem >> rB) | ((welem << (esizeB - rB)) & ((1n << esizeB) - 1n)));
+    // Replicate across 32 or 64 bits
+    const totalBits = is64 ? 64 : 32;
+    let out = 0n;
+    for (let pos = 0; pos < totalBits; pos += esize) {
+      out |= rotated << BigInt(pos);
+    }
+    return out;
+  }
+
   class CodeBuf {
     constructor() {
       this.b = [];
@@ -65,7 +75,7 @@
       this.b.push(OP.I32_CONST, ...sleb128(v | 0));
     }
     i64Const(v) {
-      this.b.push(OP.I64_CONST, ...sleb128(typeof v === 'bigint' ? v : BigInt(v)));
+      this.b.push(OP.I64_CONST, ...sleb128(BigInt.asIntN(64, typeof v === 'bigint' ? v : BigInt(v))));
     }
     localGet(idx) {
       this.b.push(OP.LOCAL_GET, ...uleb128(idx));
@@ -88,7 +98,6 @@
     storeI64(offset = 0, align = 3) {
       this.b.push(OP.I64_STORE, ...uleb128(align), ...uleb128(offset));
     }
-    // Load AArch64 register (r=31 is XZR unless useSp=true)
     getReg(r, useSp = false, is32 = false) {
       if (r === 31 && !useSp) {
         this.i64Const(0n);
@@ -101,7 +110,6 @@
         this.op(OP.I64_AND);
       }
     }
-    // Emit address for storing AArch64 register; call before pushing value, then call endSetReg
     beginSetReg(r, useSp = false) {
       if (r === 31 && !useSp) return false;
       this.i32Const(r === 31 ? OFF_SP : OFF_X(r));
@@ -123,7 +131,6 @@
       this.i64Const(BigInt(pcVal >>> 0));
       this.storeI64(0, 3);
     }
-    // Emit condition check (leaves i32 0/1 on stack) from NZCV flags
     emitCond(cond) {
       const base = cond & 0xe;
       const loadFlag = (off) => {
@@ -131,36 +138,28 @@
         this.loadI32(0, 2);
       };
       switch (base) {
-        case 0x0: // EQ: Z == 1
-          loadFlag(OFF_Z);
-          break;
-        case 0x2: // CS/HS: C == 1
-          loadFlag(OFF_C);
-          break;
-        case 0x4: // MI: N == 1
-          loadFlag(OFF_N);
-          break;
-        case 0x6: // VS: V == 1
-          loadFlag(OFF_V);
-          break;
-        case 0x8: // HI: C == 1 && Z == 0
+        case 0x0: loadFlag(OFF_Z); break;
+        case 0x2: loadFlag(OFF_C); break;
+        case 0x4: loadFlag(OFF_N); break;
+        case 0x6: loadFlag(OFF_V); break;
+        case 0x8:
           loadFlag(OFF_C);
           loadFlag(OFF_Z);
           this.op(OP.I32_EQZ, OP.I32_AND);
           break;
-        case 0xa: // GE: N == V
+        case 0xa:
           loadFlag(OFF_N);
           loadFlag(OFF_V);
           this.op(OP.I32_EQ);
           break;
-        case 0xc: // GT: Z == 0 && N == V
+        case 0xc:
           loadFlag(OFF_Z);
           this.op(OP.I32_EQZ);
           loadFlag(OFF_N);
           loadFlag(OFF_V);
           this.op(OP.I32_EQ, OP.I32_AND);
           break;
-        case 0xe: // AL
+        case 0xe:
           this.i32Const(1);
           break;
       }
@@ -170,34 +169,25 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Build the WASM-Internal Dispatch Loop Module (compiled ONCE per engine)
-  // Exports: run_slice(budget: i32) -> i32 (STATUS)
-  // Imports: env.mem (memory), env.tbl (table funcref)
-  // ---------------------------------------------------------------------------
   function buildDispatcherModule(memMinPages = 16, tableMin = 1024) {
     const mb = new ModuleBuilder();
-    const tBlock = mb.addType([], [VALTYPE.I32]);        // () -> i32
-    const tRun = mb.addType([VALTYPE.I32], [VALTYPE.I32]); // (budget: i32) -> i32
+    const tBlock = mb.addType([], [VALTYPE.I32]);
+    const tRun = mb.addType([VALTYPE.I32], [VALTYPE.I32]);
     mb.importMemory('env', 'mem', memMinPages);
     mb.importTable('env', 'tbl', tableMin);
 
-    // locals: 0=budget(param), 1=pc, 2=slotAddr, 3=status
     const c = new CodeBuf();
     c.op(OP.LOOP, VALTYPE.VOID);
-    // if budget <= 0 return STATUS.YIELD
     c.localGet(0);
     c.i32Const(0);
     c.op(OP.I32_LE_S, OP.IF, VALTYPE.VOID);
     c.i32Const(STATUS.YIELD);
     c.op(OP.RETURN, OP.END);
 
-    // pc = i32.load(OFF_PC)
     c.i32Const(OFF_PC);
     c.loadI32(0, 2);
     c.localTee(1);
 
-    // slotAddr = ICACHE_BASE + (((pc >>> 2) & ICACHE_MASK) << 3)
     c.i32Const(2);
     c.op(OP.I32_SHR_U);
     c.i32Const(ICACHE_MASK);
@@ -208,46 +198,36 @@
     c.op(OP.I32_ADD);
     c.localTee(2);
 
-    // if i32.load(slotAddr) != pc -> return STATUS.CACHE_MISS
     c.loadI32(0, 2);
     c.localGet(1);
     c.op(OP.I32_NE, OP.IF, VALTYPE.VOID);
     c.i32Const(STATUS.CACHE_MISS);
     c.op(OP.RETURN, OP.END);
 
-    // tblIdx = i32.load(slotAddr + 4)
     c.localGet(2);
     c.loadI32(4, 2);
-    // status = call_indirect (type 0)
     c.op(OP.CALL_INDIRECT, ...uleb128(tBlock), 0x00);
     c.localTee(3);
-    // if status != 0 return status
     c.op(OP.IF, VALTYPE.VOID);
     c.localGet(3);
     c.op(OP.RETURN, OP.END);
 
-    // budget = budget - 1; continue loop
     c.localGet(0);
     c.i32Const(1);
     c.op(OP.I32_SUB);
     c.localSet(0);
     c.op(OP.BR, 0);
-    c.op(OP.END); // end loop
+    c.op(OP.END);
 
     c.i32Const(STATUS.YIELD);
-
     mb.addFunction(tRun, [[3, VALTYPE.I32]], c.b, 'run_slice');
     return new WebAssembly.Module(mb.toUint8Array());
   }
 
-  // ---------------------------------------------------------------------------
-  // On-Device AArch64 Basic-Block Translator (reads straight from guest memory)
-  // Compiles 1 basic block starting at `startPC` into a standalone WebAssembly.Module
-  // ---------------------------------------------------------------------------
   function translateBasicBlock(memView, startPC, maxInsns = 64) {
     const mb = new ModuleBuilder();
-    const tSyscall = mb.addType([], [VALTYPE.I32]); // () -> i32 (STATUS)
-    const tBlock = mb.addType([], [VALTYPE.I32]);   // () -> i32 (STATUS)
+    const tSyscall = mb.addType([], [VALTYPE.I32]);
+    const tBlock = mb.addType([], [VALTYPE.I32]);
     mb.importMemory('env', 'mem', 1);
     const fnSyscall = mb.importFunc('env', 'syscall', tSyscall);
 
@@ -267,16 +247,39 @@
       const insn = memView.getUint32(pc, true);
       const nextPC = (pc + 4) >>> 0;
 
-      // 1. NOP (0xD503201F)
-      if (insn === 0xd503201f) {
+      // 1. NOP / DMB / DSB / ISB / CLREX / HINT
+      if (
+        insn === 0xd503201f ||
+        ((insn & 0xfffff01f) >>> 0) === 0xd503301f ||
+        ((insn & 0xfffff0ff) >>> 0) === 0xd503305f ||
+        ((insn & 0xfffff01f) >>> 0) === 0xd503201f
+      ) {
         pc = nextPC;
         continue;
       }
 
-      // 2. SVC #imm16 (0xD4000001 with imm16 in bits [20:5])
+      // 2. MRS Xt, TPIDR_EL0 (0xD53BD040) & MSR TPIDR_EL0, Xt (0xD51BD040)
+      if (((insn & 0xffffffe0) >>> 0) === 0xd53bd040) {
+        const rt = insn & 0x1f;
+        if (c.beginSetReg(rt, false)) {
+          c.i32Const(OFF_TPIDR);
+          c.loadI64(0, 3);
+          c.endSetReg(rt, false, false);
+        }
+        pc = nextPC;
+        continue;
+      }
+      if (((insn & 0xffffffe0) >>> 0) === 0xd51bd040) {
+        const rt = insn & 0x1f;
+        c.i32Const(OFF_TPIDR);
+        c.getReg(rt, false, false);
+        c.storeI64(0, 3);
+        pc = nextPC;
+        continue;
+      }
+
+      // 3. SVC #imm16
       if (((insn & 0xffe0001f) >>> 0) === 0xd4000001) {
-        // Advance PC to next instruction before calling syscall handler;
-        // if syscall returns SYSCALL_PENDING, host resumes right at nextPC after filling x0.
         c.setPC(nextPC);
         c.op(OP.CALL, ...uleb128(fnSyscall));
         c.op(OP.RETURN);
@@ -284,7 +287,7 @@
         break;
       }
 
-      // 3. B / BL (unconditional immediate branch)
+      // 4. B / BL
       if (((insn & 0x7c000000) >>> 0) === 0x14000000) {
         const isBL = (insn >>> 31) === 1;
         const imm26 = signExtend(insn & 0x03ffffff, 26);
@@ -301,7 +304,7 @@
         break;
       }
 
-      // 4. B.cond (0x54000000, bit 4 = 0)
+      // 5. B.cond
       if (((insn & 0xff000010) >>> 0) === 0x54000000) {
         const cond = insn & 0xf;
         const imm19 = signExtend((insn >>> 5) & 0x7ffff, 19);
@@ -318,7 +321,7 @@
         break;
       }
 
-      // 5. CBZ / CBNZ
+      // 6. CBZ / CBNZ
       if (((insn & 0x7e000000) >>> 0) === 0x34000000) {
         const is64 = (insn >>> 31) === 1;
         const isNZ = ((insn >>> 24) & 1) === 1;
@@ -339,7 +342,7 @@
         break;
       }
 
-      // 6. TBZ / TBNZ
+      // 7. TBZ / TBNZ
       if (((insn & 0x7e000000) >>> 0) === 0x36000000) {
         const b5 = (insn >>> 31) & 1;
         const isNZ = ((insn >>> 24) & 1) === 1;
@@ -363,11 +366,10 @@
         break;
       }
 
-      // 7. BR / BLR / RET (Indirect Branches!)
+      // 8. BR / BLR / RET
       if (((insn & 0xff9ffc1f) >>> 0) === 0xd61f0000) {
-        const opc = (insn >>> 21) & 0x3; // 0=BR, 1=BLR, 2=RET
+        const opc = (insn >>> 21) & 0x3;
         const rn = (insn >>> 5) & 0x1f;
-        // Read target register BEFORE clobbering x30 (in case of BLR x30)
         c.getReg(rn, false, false);
         c.localSet(0);
         if (opc === 1) {
@@ -384,10 +386,10 @@
         break;
       }
 
-      // 8. MOVZ / MOVK / MOVN (Move wide immediate)
+      // 9. MOVZ / MOVK / MOVN
       if (((insn & 0x1f800000) >>> 0) === 0x12800000) {
         const is64 = (insn >>> 31) === 1;
-        const opc = (insn >>> 29) & 0x3; // 0=MOVN, 2=MOVZ, 3=MOVK
+        const opc = (insn >>> 29) & 0x3;
         const hw = (insn >>> 21) & 0x3;
         const imm16 = BigInt((insn >>> 5) & 0xffff);
         const rd = insn & 0x1f;
@@ -412,7 +414,7 @@
         continue;
       }
 
-      // 9. ADR / ADRP
+      // 10. ADR / ADRP
       if (((insn & 0x1f000000) >>> 0) === 0x10000000) {
         const isADRP = (insn >>> 31) === 1;
         const immlo = (insn >>> 29) & 0x3;
@@ -429,7 +431,130 @@
         continue;
       }
 
-      // 10. ADD / ADDS / SUB / SUBS (immediate)
+      // 11. Logical immediate: AND, ORR, EOR, ANDS (imm)
+      if (((insn & 0x1f800000) >>> 0) === 0x12000000) {
+        const is64 = (insn >>> 31) === 1;
+        const opc = (insn >>> 29) & 0x3;
+        const immN = (insn >>> 22) & 1;
+        const immr = (insn >>> 16) & 0x3f;
+        const imms = (insn >>> 10) & 0x3f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        const imm = decodeBitMasks(immN, imms, immr, is64);
+        const rdIsSp = opc !== 3;
+        c.getReg(rn, false, !is64);
+        c.i64Const(imm);
+        if (opc === 0 || opc === 3) c.op(OP.I64_AND);
+        else if (opc === 1) c.op(OP.I64_OR);
+        else if (opc === 2) c.op(OP.I64_XOR);
+        if (!is64) {
+          c.i64Const(0xffffffffn);
+          c.op(OP.I64_AND);
+        }
+        c.localSet(2);
+        if (c.beginSetReg(rd, rdIsSp)) {
+          c.localGet(2);
+          c.endSetReg(rd, rdIsSp, !is64);
+        }
+        if (opc === 3) emitLogicalFlags(c, is64);
+        pc = nextPC;
+        continue;
+      }
+
+      // 12. Bitfield: SBFM (opc=0), BFM (opc=1), UBFM (opc=2)
+      // Covers LSL/LSR/ASR imm, SXTB/SXTH/SXTW, UXTB/UXTH, UBFX/SBFX/BFI!
+      if (((insn & 0x1f800000) >>> 0) === 0x13000000) {
+        const is64 = (insn >>> 31) === 1;
+        const opc = (insn >>> 29) & 0x3;
+        const immr = (insn >>> 16) & 0x3f;
+        const imms = (insn >>> 10) & 0x3f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        const bits = is64 ? 64 : 32;
+
+        if (c.beginSetReg(rd, false)) {
+          if (opc === 2) {
+            // UBFM
+            c.getReg(rn, false, !is64);
+            if (imms >= immr) {
+              // UBFX: (src >> immr) & ((1 << (imms - immr + 1)) - 1)
+              const width = imms - immr + 1;
+              if (immr > 0) {
+                c.i64Const(BigInt(immr));
+                c.op(OP.I64_SHR_U);
+              }
+              if (width < 64) {
+                c.i64Const((1n << BigInt(width)) - 1n);
+                c.op(OP.I64_AND);
+              }
+            } else {
+              // UBFIZ / LSL imm: (src & ((1 << (imms + 1)) - 1)) << (bits - immr)
+              const width = imms + 1;
+              const lshift = bits - immr;
+              if (width < 64) {
+                c.i64Const((1n << BigInt(width)) - 1n);
+                c.op(OP.I64_AND);
+              }
+              c.i64Const(BigInt(lshift));
+              c.op(OP.I64_SHL);
+            }
+          } else if (opc === 0) {
+            // SBFM: sign-extend from bit `imms` (or SBFX / ASR / SXTB/H/W)
+            c.getReg(rn, false, !is64);
+            if (imms >= immr) {
+              // SBFX: shift left by (63 - imms), then arithmetic shift right by (63 - imms + immr)
+              const shl = 63 - imms;
+              const shr = shl + immr;
+              if (shl > 0) {
+                c.i64Const(BigInt(shl));
+                c.op(OP.I64_SHL);
+              }
+              if (shr > 0) {
+                c.i64Const(BigInt(shr));
+                c.op(OP.I64_SHR_S);
+              }
+            } else {
+              // SBFIZ
+              const shl = 63 - imms;
+              const shr = shl - (bits - immr);
+              if (shl > 0) {
+                c.i64Const(BigInt(shl));
+                c.op(OP.I64_SHL);
+              }
+              if (shr > 0) {
+                c.i64Const(BigInt(shr));
+                c.op(OP.I64_SHR_S);
+              }
+            }
+          } else {
+            // BFM (opc === 1): insert bitfield into dst
+            const dstWidth = imms >= immr ? imms - immr + 1 : imms + 1;
+            const fieldMask = dstWidth >= 64 ? -1n : (1n << BigInt(dstWidth)) - 1n;
+            const dstPos = imms >= immr ? 0 : bits - immr;
+            const clearMask = ~(fieldMask << BigInt(dstPos));
+            c.getReg(rd, false, !is64);
+            c.i64Const(clearMask);
+            c.op(OP.I64_AND);
+            c.getReg(rn, false, !is64);
+            if (imms >= immr && immr > 0) {
+              c.i64Const(BigInt(immr));
+              c.op(OP.I64_SHR_U);
+            }
+            c.i64Const(fieldMask);
+            c.op(OP.I64_AND);
+            if (dstPos > 0) {
+              c.i64Const(BigInt(dstPos));
+              c.op(OP.I64_SHL);
+            }
+            c.op(OP.I64_OR);
+          }
+          c.endSetReg(rd, false, !is64);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 13. ADD / ADDS / SUB / SUBS (immediate)
       if (((insn & 0x1f800000) >>> 0) === 0x11000000) {
         const is64 = (insn >>> 31) === 1;
         const isSub = ((insn >>> 30) & 1) === 1;
@@ -449,7 +574,7 @@
         continue;
       }
 
-      // 11. ADD / ADDS / SUB / SUBS (shifted register)
+      // 14. ADD / ADDS / SUB / SUBS (shifted register)
       if (((insn & 0x1f200000) >>> 0) === 0x0b000000) {
         const is64 = (insn >>> 31) === 1;
         const isSub = ((insn >>> 30) & 1) === 1;
@@ -469,10 +594,39 @@
         continue;
       }
 
-      // 12. Logical (shifted register): AND, ORR, EOR, ANDS (also MOV Xd, Xm = ORR Xd, XZR, Xm)
+      // 15. ADD / ADDS / SUB / SUBS (extended register)
+      if (((insn & 0x1f200000) >>> 0) === 0x0b200000) {
+        const is64 = (insn >>> 31) === 1;
+        const isSub = ((insn >>> 30) & 1) === 1;
+        const setFlags = ((insn >>> 29) & 1) === 1;
+        const rm = (insn >>> 16) & 0x1f;
+        const option = (insn >>> 13) & 0x7;
+        const imm3 = (insn >>> 10) & 0x7;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        const rdIsSp = !setFlags;
+        c.getReg(rn, true, !is64);
+        c.localSet(0);
+        c.getReg(rm, false, false);
+        emitExtend(c, option);
+        if (imm3 > 0) {
+          c.i64Const(BigInt(imm3));
+          c.op(OP.I64_SHL);
+        }
+        if (!is64) {
+          c.i64Const(0xffffffffn);
+          c.op(OP.I64_AND);
+        }
+        c.localSet(1);
+        emitAddSub(c, is64, isSub, setFlags, rd, rdIsSp);
+        pc = nextPC;
+        continue;
+      }
+
+      // 16. Logical (shifted register)
       if (((insn & 0x1f000000) >>> 0) === 0x0a000000) {
         const is64 = (insn >>> 31) === 1;
-        const opc = (insn >>> 29) & 0x3; // 0=AND, 1=ORR, 2=EOR, 3=ANDS
+        const opc = (insn >>> 29) & 0x3;
         const shiftType = (insn >>> 22) & 0x3;
         const invert = ((insn >>> 21) & 1) === 1;
         const rm = (insn >>> 16) & 0x1f;
@@ -500,14 +654,87 @@
           c.storeI64(0, 3);
         }
         c.op(OP.DROP);
-        if (opc === 3) {
-          emitLogicalFlags(c, is64);
+        if (opc === 3) emitLogicalFlags(c, is64);
+        pc = nextPC;
+        continue;
+      }
+
+      // 17. Conditional Select: CSEL, CSINC, CSINV, CSNEG
+      if (((insn & 0x1fe00c00) >>> 0) === 0x1a800000) {
+        const is64 = (insn >>> 31) === 1;
+        const isInv = ((insn >>> 30) & 1) === 1;
+        const rm = (insn >>> 16) & 0x1f;
+        const cond = (insn >>> 12) & 0xf;
+        const isInc = ((insn >>> 10) & 1) === 1;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        if (c.beginSetReg(rd, false)) {
+          c.emitCond(cond);
+          c.op(OP.IF, VALTYPE.I64);
+          c.getReg(rn, false, !is64);
+          c.op(OP.ELSE);
+          c.getReg(rm, false, !is64);
+          if (isInv) {
+            c.i64Const(-1n);
+            c.op(OP.I64_XOR);
+          }
+          if (isInc) {
+            c.i64Const(1n);
+            c.op(OP.I64_ADD);
+          }
+          c.op(OP.END);
+          c.endSetReg(rd, false, !is64);
         }
         pc = nextPC;
         continue;
       }
 
-      // 13. MADD / MSUB (3-source: MUL is MADD Xd, Xn, Xm, XZR)
+      // 18. Data-processing (2-source): UDIV, SDIV, LSLV, LSRV, ASRV, RORV
+      if (((insn & 0x5fe00000) >>> 0) === 0x1ac00000) {
+        const is64 = (insn >>> 31) === 1;
+        const rm = (insn >>> 16) & 0x1f;
+        const opcode = (insn >>> 10) & 0x3f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        if (c.beginSetReg(rd, false)) {
+          if (opcode === 0x02 || opcode === 0x03) {
+            // UDIV (2) / SDIV (3) — ARMv8 returns 0 on divide-by-zero
+            c.getReg(rm, false, !is64);
+            c.localTee(1);
+            c.op(OP.I64_EQZ, OP.IF, VALTYPE.I64);
+            c.i64Const(0n);
+            c.op(OP.ELSE);
+            c.getReg(rn, false, !is64);
+            if (opcode === 0x03 && !is64) {
+              c.op(OP.I32_WRAP_I64, OP.I64_EXTEND_I32_S);
+              c.localGet(1);
+              c.op(OP.I32_WRAP_I64, OP.I64_EXTEND_I32_S);
+            } else {
+              c.localGet(1);
+            }
+            c.op(opcode === 0x02 ? OP.I64_DIV_U : OP.I64_DIV_S);
+            c.op(OP.END);
+          } else {
+            // Shifts: 0x08=LSLV, 0x09=LSRV, 0x0a=ASRV, 0x0b=RORV
+            c.getReg(rn, false, !is64);
+            if (opcode === 0x0a && !is64) {
+              c.op(OP.I32_WRAP_I64, OP.I64_EXTEND_I32_S);
+            }
+            c.getReg(rm, false, false);
+            c.i64Const(is64 ? 63n : 31n);
+            c.op(OP.I64_AND);
+            if (opcode === 0x08) c.op(OP.I64_SHL);
+            else if (opcode === 0x09) c.op(OP.I64_SHR_U);
+            else if (opcode === 0x0a) c.op(OP.I64_SHR_S);
+            else if (opcode === 0x0b) c.op(OP.I64_ROTR);
+          }
+          c.endSetReg(rd, false, !is64);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 19. MADD / MSUB (MUL)
       if (((insn & 0x7fe00000) >>> 0) === 0x1b000000) {
         const is64 = (insn >>> 31) === 1;
         const isSub = ((insn >>> 15) & 1) === 1;
@@ -527,20 +754,77 @@
         continue;
       }
 
-      // 14. Load/Store unsigned immediate: LDR/STR (8/16/32/64-bit)
-      if (((insn & 0x3b000000) >>> 0) === 0x39000000) {
-        const size = (insn >>> 30) & 0x3; // 0=1B, 1=2B, 2=4B, 3=8B
-        const opc = (insn >>> 22) & 0x3;  // 0=STR, 1=LDR(u), 2=LDRSW/64s, 3=LDR32s
-        const imm12 = (insn >>> 10) & 0xfff;
+      // 20. Load/Store Exclusive (LDXR/LDAXR/STXR/STLXR) for musl atomics
+      if (((insn & 0x3f200000) >>> 0) === 0x08000000) {
+        const size = (insn >>> 30) & 0x3;
+        const isLoad = ((insn >>> 22) & 1) === 1;
+        const rs = (insn >>> 16) & 0x1f;
         const rn = (insn >>> 5) & 0x1f;
         const rt = insn & 0x1f;
-        const byteOff = imm12 << size;
-        emitLoadStore(c, size, opc, rn, rt, byteOff, 0);
+        c.getReg(rn, true, false);
+        c.op(OP.I32_WRAP_I64);
+        c.localSet(3);
+        if (isLoad) {
+          emitLoadStoreAtLocal3(c, size, 1, rt);
+        } else {
+          emitLoadStoreAtLocal3(c, size, 0, rt);
+          // Cooperative single-thread: exclusive store always succeeds (Ws = 0)
+          if (c.beginSetReg(rs, false)) {
+            c.i64Const(0n);
+            c.endSetReg(rs, false, true);
+          }
+        }
         pc = nextPC;
         continue;
       }
 
-      // 15. Load/Store register offset: LDR/STR Xt, [Xn, Xm]
+      // 21. Load/Store unsigned immediate
+      if (((insn & 0x3b000000) >>> 0) === 0x39000000) {
+        const size = (insn >>> 30) & 0x3;
+        const opc = (insn >>> 22) & 0x3;
+        const imm12 = (insn >>> 10) & 0xfff;
+        const rn = (insn >>> 5) & 0x1f;
+        const rt = insn & 0x1f;
+        emitLoadStore(c, size, opc, rn, rt, imm12 << size);
+        pc = nextPC;
+        continue;
+      }
+
+      // 22. Load/Store unscaled (LDUR/STUR), post-index, and pre-index
+      if (
+        ((insn & 0x3b200c00) >>> 0) === 0x38000000 ||
+        ((insn & 0x3b200c00) >>> 0) === 0x38000400 ||
+        ((insn & 0x3b200c00) >>> 0) === 0x38000c00
+      ) {
+        const size = (insn >>> 30) & 0x3;
+        const opc = (insn >>> 22) & 0x3;
+        const mode = (insn >>> 10) & 0x3; // 0=unscaled, 1=post-index, 3=pre-index
+        const imm9 = signExtend((insn >>> 12) & 0x1ff, 9);
+        const rn = (insn >>> 5) & 0x1f;
+        const rt = insn & 0x1f;
+
+        c.getReg(rn, true, false);
+        if (mode === 0 || mode === 3) {
+          c.i64Const(BigInt(imm9));
+          c.op(OP.I64_ADD);
+        }
+        c.op(OP.I32_WRAP_I64);
+        c.localSet(3);
+        emitLoadStoreAtLocal3(c, size, opc, rt);
+
+        if (mode === 1 || mode === 3) {
+          if (c.beginSetReg(rn, true)) {
+            c.getReg(rn, true, false);
+            c.i64Const(BigInt(imm9));
+            c.op(OP.I64_ADD);
+            c.endSetReg(rn, true, false);
+          }
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 23. Load/Store register offset
       if (((insn & 0x3b200c00) >>> 0) === 0x38200800) {
         const size = (insn >>> 30) & 0x3;
         const opc = (insn >>> 22) & 0x3;
@@ -561,10 +845,13 @@
         continue;
       }
 
-      // 16. LDP / STP (64-bit signed offset, pre-index, post-index)
-      if (((insn & 0x7e400000) >>> 0) === 0x28000000 || ((insn & 0x7e400000) >>> 0) === 0x28400000) {
+      // 24. LDP / STP
+      if (
+        ((insn & 0x7e400000) >>> 0) === 0x28000000 ||
+        ((insn & 0x7e400000) >>> 0) === 0x28400000
+      ) {
         const is64 = (insn >>> 31) === 1;
-        const mode = (insn >>> 23) & 0x3; // 1=post, 2=signed-off, 3=pre
+        const mode = (insn >>> 23) & 0x3;
         const isLoad = ((insn >>> 22) & 1) === 1;
         const imm7 = signExtend((insn >>> 15) & 0x7f, 7);
         const rt2 = (insn >>> 10) & 0x1f;
@@ -573,7 +860,6 @@
         const scale = is64 ? 8 : 4;
         const offset = imm7 * scale;
 
-        // Compute base address in local 3
         c.getReg(rn, true, false);
         if (mode === 2 || mode === 3) {
           c.i64Const(BigInt(offset));
@@ -606,7 +892,6 @@
           else { c.op(OP.I32_WRAP_I64); c.storeI32(scale, 2); }
         }
 
-        // Writeback for pre-index (3) or post-index (1)
         if (mode === 1 || mode === 3) {
           if (c.beginSetReg(rn, true)) {
             c.getReg(rn, true, false);
@@ -637,6 +922,19 @@
     return new WebAssembly.Module(mb.toUint8Array());
   }
 
+  function emitExtend(c, option) {
+    // 0=UXTB, 1=UXTH, 2=UXTW, 3=UXTX, 4=SXTB, 5=SXTH, 6=SXTW, 7=SXTX
+    switch (option) {
+      case 0: c.i64Const(0xffn); c.op(OP.I64_AND); break;
+      case 1: c.i64Const(0xffffn); c.op(OP.I64_AND); break;
+      case 2: c.i64Const(0xffffffffn); c.op(OP.I64_AND); break;
+      case 4: c.i64Const(56n); c.op(OP.I64_SHL); c.i64Const(56n); c.op(OP.I64_SHR_S); break;
+      case 5: c.i64Const(48n); c.op(OP.I64_SHL); c.i64Const(48n); c.op(OP.I64_SHR_S); break;
+      case 6: c.op(OP.I32_WRAP_I64, OP.I64_EXTEND_I32_S); break;
+      default: break;
+    }
+  }
+
   function emitShift(c, shiftType, amount, is64) {
     if (amount === 0) return;
     c.i64Const(BigInt(amount));
@@ -644,7 +942,6 @@
     else if (shiftType === 1) c.op(OP.I64_SHR_U);
     else if (shiftType === 2) {
       if (!is64) {
-        // sign extend 32-bit before arithmetic right shift
         c.op(OP.DROP);
         c.op(OP.I32_WRAP_I64, OP.I64_EXTEND_I32_S);
         c.i64Const(BigInt(amount));
@@ -676,7 +973,6 @@
 
     if (setFlags) {
       const signShift = is64 ? 63n : 31n;
-      // N = (res >> signShift) & 1
       c.i32Const(OFF_N);
       c.localGet(2);
       c.i64Const(signShift);
@@ -685,13 +981,11 @@
       c.op(OP.I32_AND);
       c.storeI32(0, 2);
 
-      // Z = (res == 0)
       c.i32Const(OFF_Z);
       c.localGet(2);
       c.op(OP.I64_EQZ);
       c.storeI32(0, 2);
 
-      // C: for SUB -> a >=u b; for ADD -> res <u a
       c.i32Const(OFF_C);
       if (isSub) {
         c.localGet(0);
@@ -704,9 +998,6 @@
       }
       c.storeI32(0, 2);
 
-      // V: signed overflow
-      // ADD: ((~(a ^ b)) & (a ^ r)) >> signShift & 1
-      // SUB: ((a ^ b) & (a ^ r)) >> signShift & 1
       c.i32Const(OFF_V);
       c.localGet(0);
       c.localGet(1);
@@ -762,7 +1053,6 @@
 
   function emitLoadStoreAtLocal3(c, size, opc, rt) {
     if (opc === 0) {
-      // STR
       c.localGet(3);
       c.getReg(rt, false, false);
       if (size === 0) c.op(OP.I64_STORE8, 0, 0);
@@ -770,7 +1060,6 @@
       else if (size === 2) c.op(OP.I64_STORE32, 2, 0);
       else c.storeI64(0, 3);
     } else {
-      // LDR
       const isSigned = opc === 2 || opc === 3;
       const is32Target = opc === 3 || (opc === 1 && size <= 2);
       if (c.beginSetReg(rt, false)) {
@@ -784,18 +1073,17 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Shared Compiled-Block Module Cache (reusable across fork()ed processes!)
-  // ---------------------------------------------------------------------------
   class DBTEngine {
     constructor() {
       this.dispatcherModule = buildDispatcherModule(16, 1024);
-      this.moduleCache = new Map(); // key: `${pc}:${firstInsn}` -> WebAssembly.Module
+      this.moduleCache = new Map();
     }
 
     getOrCompileBlock(memView, pc) {
-      const firstInsn = memView.getUint32(pc, true);
-      const key = `${pc}:${firstInsn}`;
+      // Hash first 2 instructions to avoid stale cache hits across execve() at same PC
+      const w0 = memView.getUint32(pc, true);
+      const w1 = pc + 4 < memView.byteLength ? memView.getUint32(pc + 4, true) : 0;
+      const key = `${pc}:${w0}:${w1}`;
       let mod = this.moduleCache.get(key);
       if (!mod) {
         mod = translateBasicBlock(memView, pc);
@@ -805,16 +1093,13 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // GuestCPU: owns linear memory, WebAssembly.Table, I-Cache, and dispatcher
-  // ---------------------------------------------------------------------------
   class GuestCPU {
     constructor(engine, syscallBridge, initialPages = 64, maxPages = 4096) {
       this.engine = engine;
       this.syscallBridge = syscallBridge;
       this.memory = new WebAssembly.Memory({ initial: initialPages, maximum: maxPages });
       this.table = new WebAssembly.Table({ initial: 1024, maximum: 16384, element: 'anyfunc' });
-      this.nextTableIdx = 1; // reserve 0
+      this.nextTableIdx = 1;
       this.pcToTableIdx = new Map();
       this.compiledBlocks = 0;
 
@@ -850,7 +1135,6 @@
       this.view.setBigUint64(OFF_PC, BigInt(pc >>> 0), true);
     }
 
-    // Ensure guest memory covers [0 .. byteSize)
     ensureMemory(byteSize) {
       const cur = this.memory.buffer.byteLength;
       if (byteSize <= cur) return true;
@@ -859,7 +1143,13 @@
       return true;
     }
 
-    // Install or look up a compiled block at `pc` in this process's Table + I-Cache
+    // Flush CPU state, I-Cache, and block table when execve() replaces the process image
+    resetForExec() {
+      this.u8.fill(0, 0, ICACHE_BASE + ICACHE_ENTRIES * 8);
+      this.pcToTableIdx.clear();
+      this.nextTableIdx = 1;
+    }
+
     ensureBlock(pc) {
       pc = pc >>> 0;
       let idx = this.pcToTableIdx.get(pc);
@@ -879,7 +1169,6 @@
         this.pcToTableIdx.set(pc, idx);
         this.compiledBlocks++;
       }
-      // Write direct-mapped I-Cache entry
       const slotAddr = ICACHE_BASE + (((pc >>> 2) & ICACHE_MASK) << 3);
       const dv = this.view;
       dv.setUint32(slotAddr, pc, true);
@@ -887,7 +1176,6 @@
       return idx;
     }
 
-    // Execute up to `budget` basic blocks using WASM-internal dispatch loop
     stepWasmLoop(budget = 4096) {
       let remaining = budget;
       while (remaining > 0) {
@@ -902,7 +1190,6 @@
       return STATUS.YIELD;
     }
 
-    // Baseline comparison mode: JS-side per-basic-block dispatch (like v1 guest.js)
     stepJSPerBlock(budget = 4096) {
       for (let i = 0; i < budget; i++) {
         const pc = this.getPC();
@@ -914,21 +1201,15 @@
       return STATUS.YIELD;
     }
 
-    // Clone CPU + linear memory for fork()
     cloneForFork(newSyscallBridge) {
       const pages = this.memory.buffer.byteLength / 65536;
       const child = new GuestCPU(this.engine, newSyscallBridge, pages, 4096);
-      // Single memcpy snapshots registers + stack + heap + code!
       child.u8.set(this.u8);
-      // Clear child's I-Cache so it lazily binds blocks to child's own memory instance
       child.u8.fill(0, ICACHE_BASE, ICACHE_BASE + ICACHE_ENTRIES * 8);
       return child;
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Minimal ELF64 AArch64 Loader (PT_LOAD segments -> compact 32-bit memory)
-  // ---------------------------------------------------------------------------
   function loadELF64(cpu, elfBytes) {
     const dv = new DataView(elfBytes.buffer, elfBytes.byteOffset, elfBytes.byteLength);
     if (
@@ -950,7 +1231,7 @@
     for (let i = 0; i < phnum; i++) {
       const off = phoff + i * phentsize;
       const pType = dv.getUint32(off, true);
-      if (pType !== 1) continue; // PT_LOAD
+      if (pType !== 1) continue;
       const pOffset = Number(dv.getBigUint64(off + 8, true));
       const pVaddr = Number(dv.getBigUint64(off + 16, true));
       const pFilesz = Number(dv.getBigUint64(off + 32, true));
@@ -984,5 +1265,6 @@
     GuestCPU,
     loadELF64,
     translateBasicBlock,
+    decodeBitMasks,
   };
 });

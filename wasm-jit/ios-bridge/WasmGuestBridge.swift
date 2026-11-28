@@ -1,20 +1,14 @@
 import Foundation
 import WebKit
 
-/// Delegate for PTY I/O and host-side sandboxed rootfs operations.
 public protocol GuestHostDelegate: AnyObject {
     func guestDidWriteStdout(_ text: String)
     func guestDidWriteStderr(_ text: String)
     func guestDidExit(pid: Int, exitCode: Int)
-    /// Asynchronously supply up to `maxLen` bytes of PTY stdin (returns empty Data on EOF).
     func guestRequestStdin(maxLen: Int, completion: @escaping (Result<Data, Error>) -> Void)
-    /// Called if iOS Jetsam terminates the out-of-process WKWebView WebContent process.
     func guestWebContentProcessDidTerminate()
 }
 
-/// Optional custom WKURLSchemeHandler (`iterminal-host://`) enabling future Web Worker
-/// isolation with Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy headers
-/// (for SharedArrayBuffer + Atomics.wait) or synchronous Worker XHR RPC.
 public final class ITerminalSchemeHandler: NSObject, WKURLSchemeHandler {
     private let bundleHTML: String
 
@@ -46,10 +40,6 @@ public final class ITerminalSchemeHandler: NSObject, WKURLSchemeHandler {
     public func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
 }
 
-/// Upgraded WKWebView host bridge for iTerminal wasm-jit v2:
-/// - Runs on-device AArch64->WASM dynamic translation directly inside WebKit's JSC JIT
-/// - Bridges suspendable blocking syscalls (PTY read, sandbox I/O) via reqId Promise callbacks
-/// - Handles Jetsam WebContent termination notifications cleanly
 public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private var webView: WKWebView!
     public weak var delegate: GuestHostDelegate?
@@ -59,10 +49,10 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         super.init()
     }
 
-    /// Initialize headless WKWebView with wasm-jit v2 runtime scripts injected.
     public func setup(
         encoderJS: String,
         dbtRuntimeJS: String,
+        vfsMemFSJS: String,
         vmmSyscallsJS: String,
         guestV2JS: String,
         completion: @escaping (Error?) -> Void
@@ -71,7 +61,8 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         let contentController = WKUserContentController()
         contentController.add(self, name: "iosHost")
 
-        let combined = [encoderJS, dbtRuntimeJS, vmmSyscallsJS, guestV2JS].joined(separator: "\n;\n")
+        let combined = [encoderJS, dbtRuntimeJS, vfsMemFSJS, vmmSyscallsJS, guestV2JS]
+            .joined(separator: "\n;\n")
         let script = WKUserScript(source: combined, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         contentController.addUserScript(script)
         config.userContentController = contentController
@@ -94,17 +85,34 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         }
     }
 
-    /// Execute an unmodified AArch64 Linux ELF64 binary directly on-device via DBT + JSC JIT.
-    public func runELF(_ elfData: Data, sliceBudget: Int = 4096) {
+    /// Mount an ELF binary or data file into the in-memory VFS (e.g., `/bin/busybox`).
+    public func mountFile(path: String, data: Data, mode: Int = 0o755) {
         guard isBootstrapped else { return }
-        let b64 = elfData.base64EncodedString()
-        let js = "window.__iTerminalRunELF('\(b64)', { sliceBudget: \(sliceBudget) });"
+        let b64 = data.base64EncodedString()
+        let escapedPath = path.replacingOccurrences(of: "'", with: "\\'")
+        let js = "window.__iTerminalMountFile('\(escapedPath)', '\(b64)', \(mode));"
         DispatchQueue.main.async { [weak self] in
             self?.webView.evaluateJavaScript(js, completionHandler: nil)
         }
     }
 
-    // MARK: - WKScriptMessageHandler
+    /// Execute an unmodified AArch64 Linux ELF64 binary with argv/envp on-device via DBT + JSC JIT.
+    public func runELF(
+        _ elfData: Data,
+        argv: [String] = ["/bin/app"],
+        envp: [String] = ["PATH=/bin:/usr/bin", "HOME=/root"],
+        sliceBudget: Int = 4096
+    ) {
+        guard isBootstrapped else { return }
+        let b64 = elfData.base64EncodedString()
+        let opts: [String: Any] = ["argv": argv, "envp": envp, "sliceBudget": sliceBudget]
+        let optsJSON = (try? JSONSerialization.data(withJSONObject: opts))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let js = "window.__iTerminalRunELF('\(b64)', \(optsJSON));"
+        DispatchQueue.main.async { [weak self] in
+            self?.webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
 
     public func userContentController(
         _ userContentController: WKUserContentController,
@@ -115,41 +123,22 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
 
         switch type {
         case "stdout":
-            if let text = body["text"] as? String {
-                delegate?.guestDidWriteStdout(text)
-            }
+            if let text = body["text"] as? String { delegate?.guestDidWriteStdout(text) }
         case "stderr":
-            if let text = body["text"] as? String {
-                delegate?.guestDidWriteStderr(text)
-            }
+            if let text = body["text"] as? String { delegate?.guestDidWriteStderr(text) }
         case "exit":
-            let pid = body["pid"] as? Int ?? 1
-            let code = body["exitCode"] as? Int ?? 0
-            delegate?.guestDidExit(pid: pid, exitCode: code)
+            delegate?.guestDidExit(pid: body["pid"] as? Int ?? 1, exitCode: body["exitCode"] as? Int ?? 0)
         case "host_req":
-            guard let reqId = body["reqId"] as? Int,
-                  let op = body["op"] as? String else { return }
+            guard let reqId = body["reqId"] as? Int, let op = body["op"] as? String else { return }
             let args = body["args"] as? [String: Any] ?? [:]
-            handleAsyncHostRequest(reqId: reqId, op: op, args: args)
+            if op == "read_stdin" {
+                let maxLen = args["maxLen"] as? Int ?? 1024
+                delegate?.guestRequestStdin(maxLen: maxLen) { [weak self] result in
+                    self?.resolveHostRequest(reqId: reqId, result: result)
+                }
+            }
         default:
             break
-        }
-    }
-
-    private func handleAsyncHostRequest(reqId: Int, op: String, args: [String: Any]) {
-        switch op {
-        case "read_stdin":
-            let maxLen = args["maxLen"] as? Int ?? 1024
-            delegate?.guestRequestStdin(maxLen: maxLen) { [weak self] result in
-                self?.resolveHostRequest(reqId: reqId, result: result)
-            }
-        default:
-            resolveHostRequest(
-                reqId: reqId,
-                result: .failure(NSError(domain: "WasmGuestBridgeV2", code: -38, userInfo: [
-                    NSLocalizedDescriptionKey: "Unsupported host op: \(op)"
-                ]))
-            )
         }
     }
 
@@ -157,8 +146,7 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         let js: String
         switch result {
         case .success(let data):
-            let b64 = data.base64EncodedString()
-            js = "window.__iTerminalResolveHostReq(\(reqId), '\(b64)', null);"
+            js = "window.__iTerminalResolveHostReq(\(reqId), '\(data.base64EncodedString())', null);"
         case .failure(let err):
             let escaped = err.localizedDescription.replacingOccurrences(of: "'", with: "\\'")
             js = "window.__iTerminalResolveHostReq(\(reqId), null, '\(escaped)');"
@@ -167,8 +155,6 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
             self?.webView.evaluateJavaScript(js, completionHandler: nil)
         }
     }
-
-    // MARK: - WKNavigationDelegate (Jetsam Recovery)
 
     public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         isBootstrapped = false
