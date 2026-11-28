@@ -1,4 +1,4 @@
-name: Build & Test iTerminal (iOS)
+name: Build & Test iTerminal (TypeScript + iOS)
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
 
 jobs:
   test-wasm-jit:
-    name: Test wasm-jit Runtime (Node.js)
+    name: Typecheck & Test wasm-jit (TypeScript)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,22 +20,41 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run wasm-jit end-to-end & benchmark suite
-        run: node wasm-jit/tests/test_suite.js
+      - name: Install wasm-jit devDependencies
+        working-directory: wasm-jit
+        run: npm install
+
+      - name: TypeScript typecheck (tsc --noEmit)
+        working-directory: wasm-jit
+        run: npm run typecheck
+
+      - name: Run 19 end-to-end & benchmark tests
+        working-directory: wasm-jit
+        run: npm test
 
   build-ios-ipa:
-    name: Build Unsigned iOS IPA (Alpine RootFS + XcodeGen)
+    name: Build Unsigned iOS IPA (esbuild + Alpine RootFS + XcodeGen)
     needs: test-wasm-jit
     runs-on: macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Bundle wasm-jit JS runtime & Alpine AArch64 minirootfs
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Compile TypeScript wasm-jit into single WKWebView bundle
+        working-directory: wasm-jit
+        run: |
+          npm install
+          npm run build:ios
+
+      - name: Bundle iterminal-runtime.js & Alpine AArch64 minirootfs
         run: |
           mkdir -p ios-app/Resources/runtime
-          cp wasm-jit/src/*.js ios-app/Resources/runtime/
-          cp wasm-jit/runtime/guest-v2.js ios-app/Resources/runtime/
+          cp wasm-jit/dist/ios/iterminal-runtime.js ios-app/Resources/runtime/
           curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz \
             | gunzip > ios-app/Resources/runtime/alpine-minirootfs.tar
           ls -lh ios-app/Resources/runtime/
