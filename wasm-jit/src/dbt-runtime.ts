@@ -1186,11 +1186,96 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
     }
 
 
-    // 32. SIMD MOVI Vd.16B/8B, #0 (0x4F00E400 / 0x0F00E400) & EOR Vd, Vn, Vn (musl memset zero)
-    if (((insn & 0xbffffff0) >>> 0) === 0x0f00e400 || (((insn & 0xbfe0fc00) >>> 0) === 0x2e201c00 && ((insn >>> 16) & 0x1f) === ((insn >>> 5) & 0x1f))) {
-      const qt = insn & 0x1f;
-      c.i32Const(OFF_Q(qt)); c.i64Const(0n); c.storeI64(0, 3);
-      c.i32Const(OFF_Q(qt) + 8); c.i64Const(0n); c.storeI64(0, 3);
+    // 32. SIMD MOVI (all lanes: 8B/16B, 4H/8H, 2S/4S, 2D — covers 0x4F00E400 & 0x4F00E440!)
+    if (((insn & 0x9ff80c00) >>> 0) === 0x0f000400) {
+      const isQ = (insn >>> 30) === 1;
+      const opBit = (insn >>> 29) & 1;
+      const abc = (insn >>> 16) & 0x7;
+      const cmode = (insn >>> 12) & 0xf;
+      const defgh = (insn >>> 5) & 0x1f;
+      const imm8 = (abc << 5) | defgh;
+      const vd = insn & 0x1f;
+
+      let lane64 = 0n;
+      if (cmode === 14 && opBit === 0) {
+        // MOVI Vd.8B/16B, #imm8
+        lane64 = BigInt(imm8) * 0x0101010101010101n;
+      } else if (cmode === 14 && opBit === 1) {
+        // MOVI Dd / Vd.2D, #imm64 (each bit expands to 0xFF or 0x00)
+        for (let bit = 0; bit < 8; bit++) {
+          if (((imm8 >>> bit) & 1) === 1) lane64 |= 0xffn << BigInt(bit * 8);
+        }
+      } else if ((cmode & 0x9) === 0 && opBit === 0) {
+        // MOVI Vd.2S/4S, #imm8, LSL #(cmode * 4)
+        const w32 = (BigInt(imm8) << BigInt((cmode >>> 1) * 8)) & 0xffffffffn;
+        lane64 = w32 | (w32 << 32n);
+      } else if ((cmode & 0xd) === 8 && opBit === 0) {
+        // MOVI Vd.4H/8H, #imm8, LSL #((cmode - 8) * 4)
+        const h16 = (BigInt(imm8) << BigInt(((cmode - 8) >>> 1) * 8)) & 0xffffn;
+        lane64 = h16 * 0x0001000100010001n;
+      }
+
+      c.i32Const(OFF_Q(vd)); c.i64Const(lane64); c.storeI64(0, 3);
+      c.i32Const(OFF_Q(vd) + 8); c.i64Const(isQ ? lane64 : 0n); c.storeI64(0, 3);
+      pc = nextPC;
+      continue;
+    }
+
+    // 32b. SIMD Bitwise AND (0x0E201C00), BIC (0x0E601C00), EOR (0x2E201C00) on 8B/16B
+    if (
+      ((insn & 0xbfe0fc00) >>> 0) === 0x0e201c00 ||
+      ((insn & 0xbfe0fc00) >>> 0) === 0x0e601c00 ||
+      ((insn & 0xbfe0fc00) >>> 0) === 0x2e201c00
+    ) {
+      const isQ = (insn >>> 30) === 1;
+      const isEor = ((insn >>> 29) & 1) === 1;
+      const isBic = !isEor && ((insn >>> 22) & 1) === 1;
+      const rm = (insn >>> 16) & 0x1f;
+      const rn = (insn >>> 5) & 0x1f;
+      const vd = insn & 0x1f;
+
+      const emitLane = (off: number): void => {
+        c.i32Const(OFF_Q(vd) + off);
+        c.i32Const(OFF_Q(rn) + off); c.loadI64(0, 3);
+        c.i32Const(OFF_Q(rm) + off); c.loadI64(0, 3);
+        if (isBic) { c.i64Const(-1n); c.op(OP.I64_XOR); c.op(OP.I64_AND); }
+        else if (isEor) c.op(OP.I64_XOR);
+        else c.op(OP.I64_AND);
+        c.storeI64(0, 3);
+      };
+      emitLane(0);
+      if (isQ) emitLane(8);
+      else { c.i32Const(OFF_Q(vd) + 8); c.i64Const(0n); c.storeI64(0, 3); }
+      pc = nextPC;
+      continue;
+    }
+
+    // 32c. 64-bit FP/SIMD D-reg LDUR/STUR & pre/post-index (0xFC000000 / 0xFC400000)
+    if (
+      ((insn & 0xffa00c00) >>> 0) === 0xfc000000 ||
+      ((insn & 0xffa00c00) >>> 0) === 0xfc000400 ||
+      ((insn & 0xffa00c00) >>> 0) === 0xfc000c00
+    ) {
+      const isLoad = ((insn >>> 22) & 1) === 1;
+      const mode = (insn >>> 10) & 0x3;
+      const imm9 = signExtend((insn >>> 12) & 0x1ff, 9);
+      const rn = (insn >>> 5) & 0x1f;
+      const dt = insn & 0x1f;
+      c.getReg(rn, true, false);
+      if (mode === 0 || mode === 3) { c.i64Const(BigInt(imm9)); c.op(OP.I64_ADD); }
+      c.op(OP.I32_WRAP_I64);
+      c.localSet(3);
+      if (isLoad) {
+        c.i32Const(OFF_Q(dt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
+        c.i32Const(OFF_Q(dt) + 8); c.i64Const(0n); c.storeI64(0, 3);
+      } else {
+        c.localGet(3); c.i32Const(OFF_Q(dt)); c.loadI64(0, 3); c.storeI64(0, 3);
+      }
+      if (mode === 1 || mode === 3) {
+        if (c.beginSetReg(rn, true)) {
+          c.getReg(rn, true, false); c.i64Const(BigInt(imm9)); c.op(OP.I64_ADD); c.endSetReg(rn, true, false);
+        }
+      }
       pc = nextPC;
       continue;
     }

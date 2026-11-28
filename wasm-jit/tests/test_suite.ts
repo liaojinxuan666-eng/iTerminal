@@ -1102,6 +1102,32 @@ async function testUmovFmovSimd() {
   console.log(`[PASS] Test 22 (BusyBox/musl UMOV + FMOV): 0x4e083c01 & FMOV verified`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 23: Real-Device BusyBox ash MOVI V0.16B, #2 (0x4f00e440) + SIMD EOR/AND
+// ---------------------------------------------------------------------------
+async function testMoviAndSimdBitwise() {
+  const code = [
+    // Exact iPhone opcode at PC=0x9b700: 0x4f00e440 = MOVI V0.16B, #2
+    0x4f00e440,
+    0x4e083c01, // UMOV X1, V0.D[0] -> expect 0x0202020202020202
+    A64.movReg(19, 1),
+    // EOR V0.16B, V0.16B, V0.16B (0x6e201c00) -> expect 0
+    0x6e201c00,
+    0x4e083c01,
+    A64.movReg(20, 1),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 0x0202020202020202n, 'MOVI V0.16B, #2 mismatch');
+  assert.strictEqual(proc.cpu.getReg(20), 0n, 'SIMD EOR zero mismatch');
+  console.log(`[PASS] Test 23 (BusyBox ash MOVI + SIMD EOR): 0x4f00e440=0x0202020202020202`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1125,7 +1151,8 @@ async function testUmovFmovSimd() {
   await testSysregAndLdarStlr();
   await testRbitCtzRev();
   await testUmovFmovSimd();
-  console.log('\nALL 22 TESTS PASSED.');
+  await testMoviAndSimdBitwise();
+  console.log('\nALL 23 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);
