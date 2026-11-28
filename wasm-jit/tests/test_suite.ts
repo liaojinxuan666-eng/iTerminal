@@ -224,7 +224,7 @@ async function testSuspendableAsyncSyscall() {
   const { elf } = buildELF64(code);
   let stdout = '';
   const kernel = new GuestKernel(new DBTEngine(), {
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
     readStdinAsync: () => new Promise((r) => setTimeout(() => r(new TextEncoder().encode('hello PTY!\n')), 10)),
   });
   kernel.spawnELF(elf);
@@ -267,7 +267,7 @@ async function testForkPipeWait() {
   const { elf } = buildELF64(code, msg, baseVaddr);
   let stdout = '';
   const kernel = new GuestKernel(new DBTEngine(), {
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
   });
   const parent = kernel.spawnELF(elf);
   await kernel.runAll({ sliceBudget: 8 });
@@ -347,7 +347,7 @@ async function testVFSAndArgv() {
   let stdout = '';
   const kernel = new GuestKernel(new DBTEngine(), {
     fs,
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
   });
   const proc = kernel.spawnELF(elf, { argv: ['/bin/cat', '/etc/hostname'] });
   await kernel.runAll();
@@ -446,7 +446,7 @@ async function testForkExecvePipeline() {
   let stdout = '';
   const kernel = new GuestKernel(new DBTEngine(), {
     fs,
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
   });
   const parent = kernel.spawnELF(shElf, { argv: ['/bin/sh'] });
   await kernel.runAll({ sliceBudget: 16 });
@@ -575,7 +575,7 @@ async function testBusyBoxSymlinkAndTTY() {
     fs,
     rows: 40,
     cols: 120,
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
   });
   const proc = kernel.spawnELF(fs.readFile('/bin/sh')!, {
     argv: ['/bin/sh'],
@@ -756,7 +756,7 @@ async function testAsyncBSDSocket() {
   let closedSock = 0;
 
   const kernel = new GuestKernel(new DBTEngine(), {
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
     net: {
       connect: async (ip, port) => {
         connectedTarget = `${ip}:${port}`;
@@ -842,7 +842,7 @@ async function testTarRootFSBoot() {
   let stdout = '';
   const kernel = new GuestKernel(new DBTEngine(), {
     fs,
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
   });
   kernel.spawnELF(fs.readFile('/bin/sh')!, { argv: ['/bin/sh'] });
   await kernel.runAll();
@@ -943,7 +943,7 @@ async function testPreadAndReadv() {
   let stdout = '';
   const kernel = new GuestKernel(new DBTEngine(), {
     fs,
-    onStdout: (b: number) => { stdout += new TextDecoder().decode(b); },
+    onStdout: (b: Uint8Array) => { stdout += new TextDecoder().decode(b); },
   });
   kernel.spawnELF(elf);
   await kernel.runAll();

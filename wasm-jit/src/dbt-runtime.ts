@@ -211,7 +211,7 @@ function buildDispatcherModule(memMinPages = 16, tableMin = 1024): WebAssembly.M
 
   c.i32Const(STATUS.YIELD);
   mb.addFunction(tRun, [[3, VALTYPE.I32]], c.b, 'run_slice');
-  return new WebAssembly.Module(mb.toUint8Array());
+  return new WebAssembly.Module(mb.toUint8Array() as BufferSource);
 }
 
 export function translateBasicBlock(memView: DataView, startPC: number, maxInsns = 64): WebAssembly.Module {
@@ -1315,7 +1315,7 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
   }
 
   mb.addFunction(tBlock, [[3, VALTYPE.I64], [1, VALTYPE.I32], [2, VALTYPE.I64]], c.b, 'bb');
-  return new WebAssembly.Module(mb.toUint8Array());
+  return new WebAssembly.Module(mb.toUint8Array() as BufferSource);
 }
 
 function emitExtend(c: CodeBuf, option: number): void {

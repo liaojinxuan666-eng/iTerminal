@@ -116,7 +116,7 @@ export function buildTar(entries: TarBuildEntry[]): Uint8Array {
       e.type === 'file'
         ? typeof e.data === 'string'
           ? enc.encode(e.data)
-          : new Uint8Array(e.data || 0)
+          : (e.data ? new Uint8Array(e.data) : new Uint8Array(0))
         : new Uint8Array(0);
     writeOctal(hdr, 124, 12, payload.length);
     writeOctal(hdr, 136, 12, Math.floor(Date.now() / 1000));
