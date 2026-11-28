@@ -3,8 +3,8 @@ import { DirEntry, MemFS, normalizePath } from './vfs-memfs';
 
 const PAGE_SIZE = 4096;
 const AT_FDCWD = -100;
-const UTF8_ENC = UTF8_ENC;
-const UTF8_DEC = UTF8_DEC;
+const UTF8_ENC = new TextEncoder();
+const UTF8_DEC = new TextDecoder();
 
 export const SYS = {
   GETCWD: 17,
@@ -1007,9 +1007,6 @@ export class GuestKernel {
         if (fdObj.kind === 'stdout') { this.host.onStdout(bytes); return ret(bytes.length); }
         if (fdObj.kind === 'stderr') { this.host.onStderr(bytes); return ret(bytes.length); }
         if (fdObj.kind === 'pipe_w') return ret(fdObj.pipe.write(bytes));
-        if (fdObj.kind === 'dev_null') return ret(0);
-        if (fdObj.kind === 'dev_zero') { cpu.u8.fill(0, a1, a1 + a2); return ret(a2); }
-        if (fdObj.kind === 'dev_random') { for (let i = 0; i < a2; i++) cpu.u8[a1 + i] = (Math.random() * 256) | 0; return ret(a2); }
         if (fdObj.kind === 'file') {
           const cur = this.fs.readFile(fdObj.path) || new Uint8Array(0);
           const merged = new Uint8Array(Math.max(cur.length, fdObj.offset + bytes.length));
@@ -1087,6 +1084,9 @@ export class GuestKernel {
       case SYS.READ: {
         const fdObj = proc.fds.get(a0);
         if (!fdObj) return ret(-ERRNO.EBADF);
+        if (fdObj.kind === 'dev_null') return ret(0);
+        if (fdObj.kind === 'dev_zero') { cpu.u8.fill(0, a1, a1 + a2); return ret(a2); }
+        if (fdObj.kind === 'dev_random') { for (let i = 0; i < a2; i++) cpu.u8[a1 + i] = (Math.random() * 256) | 0; return ret(a2); }
         if (fdObj.kind === 'file') {
           const data = this.fs.readFile(fdObj.path) || new Uint8Array(0);
           const avail = Math.max(0, data.length - fdObj.offset);
