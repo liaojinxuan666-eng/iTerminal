@@ -34,6 +34,7 @@ export const SYS = {
   SET_TID_ADDRESS: 96,
   FUTEX: 98,
   SET_ROBUST_LIST: 99,
+  NANOSLEEP: 101,
   CLOCK_GETTIME: 113,
   KILL: 129,
   TKILL: 130,
@@ -516,6 +517,7 @@ export class GuestKernel {
     const sliceBudget = opts.sliceBudget || 4096;
     const mode = opts.mode || 'wasm';
 
+    let lastYield = Date.now();
     while (true) {
       let anyRunnable = false;
       const blockedPromises: Promise<void>[] = [];
@@ -548,6 +550,11 @@ export class GuestKernel {
       if (!anyRunnable) {
         if (blockedPromises.length === 0) break;
         await Promise.race(blockedPromises);
+        lastYield = Date.now();
+      } else if (Date.now() - lastYield >= 8) {
+        // Yield to WKWebView / Node event loop so UI, Ctrl-C, and stdin never freeze!
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        lastYield = Date.now();
       }
     }
     return this.exited;
@@ -1123,6 +1130,38 @@ export class GuestKernel {
             this.waiters.push({ resolve: check });
           })
         );
+      }
+
+      case SYS.PPOLL: {
+        // ppoll(fds, nfds, tmo_p, sigmask) — mark stdin/readable pipes as POLLIN (1)
+        const nfds = a1 >>> 0;
+        let ready = 0;
+        for (let i = 0; i < nfds; i++) {
+          const base = a0 + i * 8;
+          const fd = cpu.view.getInt32(base, true);
+          const events = cpu.view.getInt16(base + 4, true);
+          const fdObj = proc.fds.get(fd);
+          let revents = 0;
+          if (fdObj) {
+            if ((events & 1) !== 0) {
+              if (fdObj.kind === 'stdin' || fdObj.kind === 'file') revents |= 1;
+              else if (fdObj.kind === 'pipe_r' && (fdObj.pipe.chunks.length > 0 || fdObj.pipe.writers === 0)) revents |= 1;
+            }
+            if ((events & 4) !== 0 && (fdObj.kind === 'stdout' || fdObj.kind === 'stderr' || fdObj.kind === 'pipe_w')) {
+              revents |= 4;
+            }
+          }
+          cpu.view.setInt16(base + 6, revents, true);
+          if (revents !== 0) ready++;
+        }
+        return ret(ready);
+      }
+
+      case SYS.NANOSLEEP: {
+        const sec = Number(cpu.view.getBigInt64(a0, true));
+        const nsec = Number(cpu.view.getBigInt64(a0 + 8, true));
+        const ms = Math.min(Math.max(0, sec * 1000 + Math.floor(nsec / 1e6)), 5000);
+        return this._suspend(proc, new Promise<number>((resolve) => setTimeout(() => resolve(0), ms)));
       }
 
       case SYS.CLOCK_GETTIME: {

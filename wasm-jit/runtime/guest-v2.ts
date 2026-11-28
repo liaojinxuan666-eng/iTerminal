@@ -65,6 +65,39 @@ export class IOSGuestRuntime {
   private pendingHostReqs = new Map<number, PendingReq>();
   private nextReqId = 1;
   private decoder = new TextDecoder();
+  private outBuf = '';
+  private errBuf = '';
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private _flushOutput(): void {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.outBuf.length > 0) {
+      const text = this.outBuf;
+      this.outBuf = '';
+      this._postToSwift({ type: 'stdout', text });
+    }
+    if (this.errBuf.length > 0) {
+      const text = this.errBuf;
+      this.errBuf = '';
+      this._postToSwift({ type: 'stderr', text });
+    }
+  }
+
+  private _queueOutput(stream: 'stdout' | 'stderr', bytes: Uint8Array): void {
+    const chunk = this.decoder.decode(bytes, { stream: true });
+    if (stream === 'stdout') this.outBuf += chunk;
+    else this.errBuf += chunk;
+    if (this.outBuf.length + this.errBuf.length >= 4096) {
+      this._flushOutput();
+      return;
+    }
+    if (this.flushTimer === null) {
+      this.flushTimer = setTimeout(() => this._flushOutput(), 16);
+    }
+  }
 
   private _postToSwift(payload: Record<string, unknown>): void {
     window.webkit?.messageHandlers?.iosHost?.postMessage(payload);
@@ -141,10 +174,12 @@ export class IOSGuestRuntime {
         fs: this.fs,
         rows: this.ttyRows,
         cols: this.ttyCols,
-        onStdout: (bytes) => this._postToSwift({ type: 'stdout', text: this.decoder.decode(bytes) }),
-        onStderr: (bytes) => this._postToSwift({ type: 'stderr', text: this.decoder.decode(bytes) }),
-        readStdinAsync: (maxLen) =>
-          this._requestSwiftAsync<string>('read_stdin', { maxLen }).then(base64ToBytes),
+        onStdout: (bytes) => this._queueOutput('stdout', bytes),
+        onStderr: (bytes) => this._queueOutput('stderr', bytes),
+        readStdinAsync: (maxLen) => {
+          this._flushOutput();
+          return this._requestSwiftAsync<string>('read_stdin', { maxLen }).then(base64ToBytes);
+        },
         net: this._createSwiftNetAdapter(),
       });
 
@@ -152,7 +187,7 @@ export class IOSGuestRuntime {
       const proc = kernel.spawnELF(elfBytes, {
         cwd: opts.cwd || '/',
         argv: opts.argv || ['/bin/sh'],
-        envp: opts.envp || ['PATH=/bin:/sbin:/usr/bin:/usr/sbin', 'HOME=/root', 'TERM=xterm-256color'],
+        envp: opts.envp || ['PATH=/bin:/sbin:/usr/bin:/usr/sbin', 'HOME=/root', 'TERM=dumb', 'PS1=# '],
         exePath: opts.exePath,
       });
       this.activeRootPid = proc.pid;
@@ -160,11 +195,13 @@ export class IOSGuestRuntime {
       const exited = await kernel.runAll({ sliceBudget: opts.sliceBudget || 4096 });
       const exitCode = exited.get(proc.pid) ?? 0;
       this.activeKernel = null;
+      this._flushOutput();
       this._postToSwift({ type: 'exit', pid: proc.pid, exitCode });
       return exitCode;
     } catch (err) {
       this.activeKernel = null;
       const msg = err instanceof Error ? err.message : String(err);
+      this._flushOutput();
       this._postToSwift({ type: 'stderr', text: `\n[iTerminal fault] ${msg}\n` });
       this._postToSwift({ type: 'exit', pid: this.activeRootPid, exitCode: 1 });
       return 1;

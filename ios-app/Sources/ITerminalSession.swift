@@ -100,7 +100,7 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         isRunning = true
         statusText = "Running /bin/sh (WebKit JSC JIT)"
         outputLog.append("[iTerminal] Booting /bin/sh...\n")
-        bridge.runFromVFS(path: "/bin/sh", argv: ["/bin/sh", "-i"])
+        bridge.runFromVFS(path: "/bin/sh", argv: ["/bin/sh", "-i"], envp: ["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", "TERM=dumb", "PS1=# "])
     }
 
     public func sendLine(_ line: String) {
@@ -122,12 +122,19 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         bridge.saveRootFS(to: snapshotURL)
     }
 
+    private func appendOutput(_ text: String) {
+        self.outputLog.append(text)
+        if self.outputLog.count > 32000 {
+            self.outputLog = String(self.outputLog.suffix(24000))
+        }
+    }
+
     nonisolated public func guestDidWriteStdout(_ text: String) {
-        Task { @MainActor in self.outputLog.append(text) }
+        Task { @MainActor in self.appendOutput(text) }
     }
 
     nonisolated public func guestDidWriteStderr(_ text: String) {
-        Task { @MainActor in self.outputLog.append(text) }
+        Task { @MainActor in self.appendOutput(text) }
     }
 
     nonisolated public func guestDidExit(pid: Int, exitCode: Int) {
