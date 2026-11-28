@@ -49,6 +49,9 @@ export const SYS = {
   RT_SIGPROCMASK: 135,
   SETPGID: 154,
   GETPGID: 155,
+  GETSID: 156,
+  SETSID: 157,
+  GETGROUPS: 158,
   UNAME: 160,
   UMASK: 166,
   PRCTL: 167,
@@ -629,7 +632,15 @@ export class GuestKernel {
 
       case SYS.GETPID: return ret(proc.pid);
       case SYS.GETPPID: return ret(proc.ppid);
-      case SYS.GETPGID: return ret(proc.pgid);
+      case SYS.GETPGID:
+      case SYS.GETSID:
+      case SYS.SETSID:
+        return ret(proc.pgid);
+      case SYS.GETGROUPS: {
+        if (a0 === 0) return ret(1);
+        cpu.view.setUint32(a1, 0, true);
+        return ret(1);
+      }
       case SYS.SETPGID: proc.pgid = a1 || proc.pid; return ret(0);
       case SYS.GETUID:
       case SYS.GETEUID:
@@ -1187,10 +1198,17 @@ export class GuestKernel {
       case SYS.WAIT4: {
         const targetPid = a0 | 0;
         const statusPtr = a1;
+        const options = a2 | 0;
+        const WNOHANG = 1;
+
+        const matchesTarget = (p: GuestProc): boolean =>
+          p.ppid === proc.pid &&
+          (targetPid === -1 || targetPid === 0 || targetPid === p.pid || (targetPid < -1 && p.pgid === -targetPid));
+
         const tryReap = (): number | null => {
           for (const [pid, code] of this.exited.entries()) {
             const p = this.processes.get(pid);
-            if (p && p.ppid === proc.pid && (targetPid === -1 || targetPid === pid)) {
+            if (p && matchesTarget(p)) {
               this.exited.delete(pid);
               if (statusPtr) {
                 const wstatus = p.termSignal ? p.termSignal & 0x7f : (code & 0xff) << 8;
@@ -1201,8 +1219,18 @@ export class GuestKernel {
           }
           return null;
         };
+
+        const hasLivingMatchingChild = (): boolean => {
+          for (const p of this.processes.values()) {
+            if (p.state !== 'exited' && matchesTarget(p)) return true;
+          }
+          return false;
+        };
+
         const reaped = tryReap();
         if (reaped !== null) return ret(reaped);
+        if (!hasLivingMatchingChild()) return ret(-ERRNO.ECHILD);
+        if ((options & WNOHANG) !== 0) return ret(0);
 
         return this._suspend(
           proc,
@@ -1210,6 +1238,7 @@ export class GuestKernel {
             const check = (): void => {
               const r = tryReap();
               if (r !== null) resolve(r);
+              else if (!hasLivingMatchingChild()) resolve(-ERRNO.ECHILD);
               else this.waiters.push({ resolve: check });
             };
             this.waiters.push({ resolve: check });

@@ -5,18 +5,20 @@ import UIKit
 @MainActor
 public final class ITerminalSession: ObservableObject, GuestHostDelegate {
     @Published public var outputLog: String = ""
+    @Published public var pendingInput: String = ""
     @Published public var isRunning: Bool = false
     @Published public var isReady: Bool = false
     @Published public var statusText: String = "Initializing"
-    @Published public var fontSize: CGFloat = 13
+    @Published public var fontSize: CGFloat = 14
+    @Published public var ctrlActive: Bool = false
     @Published public var commandHistory: [String] = []
 
     public let bridge = WasmGuestBridgeV2()
 
-    // Lossless byte-stream stdin buffer (handles 1-byte read(0, &ch, 1) from busybox ash!)
     private var stdinBuffer = Data()
     private var pendingStdinMaxLen: Int = 0
     private var pendingStdinCompletion: ((Result<Data, Error>) -> Void)?
+    private var historyIndex: Int? = nil
 
     private var documentsURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -33,7 +35,7 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
     public func startBundledRuntime() {
         guard !isReady else { return }
         guard let runtimeJS = loadBundledJS(named: "iterminal-runtime") else {
-            statusText = "Missing runtime"
+            appendOutput("[iTerminal] Missing bundled iterminal-runtime.js\n")
             return
         }
         statusText = "Starting JSC JIT..."
@@ -41,7 +43,6 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
             Task { @MainActor in
                 guard let self = self else { return }
                 if let err = err {
-                    self.statusText = "Error"
                     self.appendOutput("[iTerminal] Bootstrap error: \(err.localizedDescription)\n")
                     return
                 }
@@ -75,26 +76,20 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
     public func mountAndBootDefaultShell() {
         if FileManager.default.fileExists(atPath: snapshotURL.path) {
             try? bridge.loadRootFS(from: snapshotURL)
-            appendOutput("[iTerminal] Alpine RootFS restored.\n")
             bootShell()
             return
         }
         guard let tarURL = findRootFSTarURL(), let tarData = try? Data(contentsOf: tarURL) else {
-            statusText = "No RootFS"
-            appendOutput("[iTerminal] No alpine-minirootfs.tar found.\n")
+            appendOutput("Welcome to iTerminal (WebKit JSC JIT)\nNo alpine-minirootfs.tar found.\n")
             return
         }
-        statusText = "Mounting RootFS..."
-        appendOutput("[iTerminal] Mounting \(tarURL.lastPathComponent) (\(tarData.count / 1024) KB)...\n")
         bridge.mountTar(tarData) { [weak self] result in
             Task { @MainActor in
                 guard let self = self else { return }
                 switch result {
-                case .success(let count):
-                    self.appendOutput("[iTerminal] Mounted \(count) entries.\n")
+                case .success:
                     self.bootShell()
                 case .failure(let err):
-                    self.statusText = "Mount failed"
                     self.appendOutput("[iTerminal] Mount error: \(err.localizedDescription)\n")
                 }
             }
@@ -104,28 +99,76 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
     public func bootShell() {
         guard isReady else { return }
         stdinBuffer.removeAll()
+        pendingInput = ""
         pendingStdinCompletion = nil
         pendingStdinMaxLen = 0
         isRunning = true
-        statusText = "/bin/sh · JSC JIT"
+        statusText = "/bin/sh"
+        if outputLog.isEmpty {
+            outputLog = "Welcome to Alpine!\n\nRunning on iTerminal (WebKit JSC JIT, no JIT entitlement).\n\n"
+        }
         bridge.runFromVFS(
             path: "/bin/sh",
             argv: ["/bin/sh", "-i"],
-            envp: ["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", "TERM=dumb", "PS1=# "]
+            envp: [
+                "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+                "HOME=/root",
+                "TERM=dumb",
+                "PS1=iPhone:\\w# ",
+            ]
         )
     }
 
-    /// Push a full command line into the byte-stream stdin buffer (lossless for 1-byte reads).
-    public func sendLine(_ line: String) {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty && commandHistory.last != trimmed {
-            commandHistory.append(trimmed)
-            if commandHistory.count > 100 { commandHistory.removeFirst() }
+    /// Direct character/keystream input from iSH-style full-screen keyboard bridge.
+    public func handleTypedText(_ text: String) {
+        if ctrlActive {
+            ctrlActive = false
+            let lower = text.lowercased()
+            if lower == "c" { sendCtrlC(); return }
+            if lower == "d" { sendEOF(); return }
+            if lower == "l" { clearOutput(); return }
         }
-        sendRawData(Data((line + "\n").utf8))
+        for ch in text {
+            if ch == "\n" || ch == "\r" {
+                let line = pendingInput
+                pendingInput = ""
+                historyIndex = nil
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && commandHistory.last != trimmed {
+                    commandHistory.append(trimmed)
+                    if commandHistory.count > 100 { commandHistory.removeFirst() }
+                }
+                sendRawData(Data((line + "\n").utf8))
+            } else {
+                pendingInput.append(ch)
+            }
+        }
     }
 
-    /// Push raw bytes (e.g. Tab, Ctrl-D) into stdin without duplicating echo.
+    public func handleBackspace() {
+        if !pendingInput.isEmpty {
+            pendingInput.removeLast()
+        }
+    }
+
+    public func navigateHistory(up: Bool) {
+        guard !commandHistory.isEmpty else { return }
+        if up {
+            if let idx = historyIndex { historyIndex = max(0, idx - 1) }
+            else { historyIndex = commandHistory.count - 1 }
+            if let idx = historyIndex { pendingInput = commandHistory[idx] }
+        } else {
+            guard let idx = historyIndex else { return }
+            if idx + 1 < commandHistory.count {
+                historyIndex = idx + 1
+                pendingInput = commandHistory[idx + 1]
+            } else {
+                historyIndex = nil
+                pendingInput = ""
+            }
+        }
+    }
+
     public func sendRawData(_ data: Data) {
         stdinBuffer.append(data)
         drainStdinIfWaiting()
@@ -151,13 +194,16 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
 
     public func sendCtrlC() {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        pendingInput = ""
         stdinBuffer.removeAll()
+        appendOutput("^C\n")
         bridge.sendInterrupt(signal: 2)
     }
 
     public func resetRootFS() {
         try? FileManager.default.removeItem(at: snapshotURL)
-        outputLog = "[iTerminal] Resetting Alpine RootFS...\n"
+        outputLog = ""
+        pendingInput = ""
         mountAndBootDefaultShell()
     }
 
@@ -170,7 +216,6 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
     }
 
     private func stripANSI(_ text: String) -> String {
-        // Clean CSI escape sequences (e.g. \x1b[32m, \x1b[0m, \x1b[K) and \r
         let cleaned = text.replacingOccurrences(
             of: "\\u{001B}\\[[0-9;?]*[ -/]*[@-~]",
             with: "",
@@ -200,7 +245,7 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         Task { @MainActor in
             self.isRunning = false
             self.statusText = "Exited (\(exitCode))"
-            self.appendOutput("\n[process exited with code \(exitCode)]\n")
+            self.appendOutput("\n[exited: \(exitCode)]\n")
             self.persistRootFS()
         }
     }
@@ -226,8 +271,7 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         Task { @MainActor in
             self.isRunning = false
             self.isReady = false
-            self.statusText = "Jetsam Killed"
-            self.appendOutput("\n[iTerminal] WebContent terminated by iOS Jetsam. Tap Restart in menu.\n")
+            self.appendOutput("\n[iTerminal] WebContent terminated by iOS Jetsam.\n")
         }
     }
 }

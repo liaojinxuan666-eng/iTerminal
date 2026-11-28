@@ -1269,6 +1269,35 @@ async function testSxtlUxtl() {
   console.log(`[PASS] Test 28 (SXTL/SSHLL V0.2D, V0.2S): 0x0f20a400 (-5, 42) verified`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 29: wait4(-1, WNOHANG) -> -ECHILD (no shell hang after 1st command!) + getgroups
+// ---------------------------------------------------------------------------
+async function testWait4EchildAndGetgroups() {
+  const code = [
+    // wait4(-1, 0, WNOHANG=1, 0) with no children -> must return -ECHILD (-10) immediately!
+    A64.movn(0, 0),  // -1
+    A64.movz(1, 0),
+    A64.movz(2, 1),  // WNOHANG
+    A64.movz(3, 0),
+    A64.movz(8, SYS.WAIT4),
+    A64.svc(0),
+    A64.movReg(19, 0),
+    // getgroups(0, 0) -> expect 1
+    A64.movz(0, 0), A64.movz(1, 0), A64.movz(8, SYS.GETGROUPS), A64.svc(0),
+    A64.movReg(20, 0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(BigInt.asIntN(64, proc.cpu.getReg(19)), -10n, 'wait4 with no children must return -ECHILD (-10)');
+  assert.strictEqual(proc.cpu.getReg(20), 1n, 'getgroups(0, 0) should return 1');
+  console.log(`[PASS] Test 29 (wait4 ECHILD + getgroups): wait4=-10 (ECHILD), getgroups=1`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1298,7 +1327,8 @@ async function testSxtlUxtl() {
   await testUnifiedSimdLoadStore();
   await testInsAndDupElement();
   await testSxtlUxtl();
-  console.log('\nALL 28 TESTS PASSED.');
+  await testWait4EchildAndGetgroups();
+  console.log('\nALL 29 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);
