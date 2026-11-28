@@ -955,14 +955,50 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       continue;
     }
 
-    // 27. Data-processing (1-source): CLZ (4), REV16 (1), REV32 (2), REV64 (3)
+    // 27. Data-processing (1-source): RBIT (0), REV16 (1), REV32 (2), REV64 (3), CLZ (4), CLS (5)
     if (((insn & 0x5fe00000) >>> 0) === 0x5ac00000) {
       const is64 = (insn >>> 31) === 1;
       const opcode = (insn >>> 10) & 0x3f;
       const rn = (insn >>> 5) & 0x1f;
       const rd = insn & 0x1f;
       if (c.beginSetReg(rd, false)) {
-        if (opcode === 4) {
+        if (opcode === 0) {
+          // RBIT (exact 32-bit / 64-bit bit reversal — used by musl a_ctz_32 / a_ctz_64!)
+          c.getReg(rn, false, !is64);
+          c.localSet(0);
+          const steps: [bigint, bigint][] = is64
+            ? [
+                [0x5555555555555555n, 1n],
+                [0x3333333333333333n, 2n],
+                [0x0f0f0f0f0f0f0f0fn, 4n],
+                [0x00ff00ff00ff00ffn, 8n],
+                [0x0000ffff0000ffffn, 16n],
+                [0x00000000ffffffffn, 32n],
+              ]
+            : [
+                [0x55555555n, 1n],
+                [0x33333333n, 2n],
+                [0x0f0f0f0fn, 4n],
+                [0x00ff00ffn, 8n],
+                [0x0000ffffn, 16n],
+              ];
+          for (const [mask, sh] of steps) {
+            // x = ((x >>> sh) & mask) | ((x & mask) << sh)
+            c.localGet(0); c.i64Const(sh); c.op(OP.I64_SHR_U); c.i64Const(mask); c.op(OP.I64_AND);
+            c.localGet(0); c.i64Const(mask); c.op(OP.I64_AND); c.i64Const(sh); c.op(OP.I64_SHL);
+            c.op(OP.I64_OR);
+            c.localSet(0);
+          }
+          c.localGet(0);
+        } else if (opcode === 1) {
+          // REV16: swap bytes inside each 16-bit halfword
+          c.getReg(rn, false, !is64);
+          c.localSet(0);
+          const m = is64 ? 0x00ff00ff00ff00ffn : 0x00ff00ffn;
+          c.localGet(0); c.i64Const(8n); c.op(OP.I64_SHR_U); c.i64Const(m); c.op(OP.I64_AND);
+          c.localGet(0); c.i64Const(m); c.op(OP.I64_AND); c.i64Const(8n); c.op(OP.I64_SHL);
+          c.op(OP.I64_OR);
+        } else if (opcode === 4) {
           // CLZ
           c.getReg(rn, false, !is64);
           if (is64) {
@@ -970,8 +1006,23 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
           } else {
             c.op(OP.I32_WRAP_I64, OP.I32_CLZ, OP.I64_EXTEND_I32_U);
           }
+        } else if (opcode === 5) {
+          // CLS: count leading sign bits (excluding sign bit itself)
+          c.getReg(rn, false, !is64);
+          c.localSet(0);
+          if (is64) {
+            c.localGet(0);
+            c.localGet(0); c.i64Const(63n); c.op(OP.I64_SHR_S);
+            c.op(OP.I64_XOR, OP.I64_CLZ);
+            c.i64Const(1n); c.op(OP.I64_SUB);
+          } else {
+            c.localGet(0); c.op(OP.I32_WRAP_I64);
+            c.localGet(0); c.op(OP.I32_WRAP_I64); c.i32Const(31); c.op(OP.I32_SHR_S);
+            c.op(OP.I32_XOR, OP.I32_CLZ);
+            c.i32Const(1); c.op(OP.I32_SUB, OP.I64_EXTEND_I32_U);
+          }
         } else if (opcode === 3 || (opcode === 2 && !is64)) {
-          // REV64 / REV32 (byte swap)
+          // REV64 / 32-bit REV
           c.getReg(rn, false, !is64);
           c.localSet(0);
           const nBytes = is64 ? 8 : 4;
@@ -983,6 +1034,22 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
             const dstShift = (nBytes - 1 - b) * 8;
             if (dstShift > 0) { c.i64Const(BigInt(dstShift)); c.op(OP.I64_SHL); }
             c.op(OP.I64_OR);
+          }
+        } else if (opcode === 2 && is64) {
+          // REV32 on 64-bit register: reverse bytes within each 32-bit word
+          c.getReg(rn, false, false);
+          c.localSet(0);
+          c.i64Const(0n);
+          for (let w = 0; w < 2; w++) {
+            for (let b = 0; b < 4; b++) {
+              const srcBit = w * 32 + b * 8;
+              const dstBit = w * 32 + (3 - b) * 8;
+              c.localGet(0);
+              if (srcBit > 0) { c.i64Const(BigInt(srcBit)); c.op(OP.I64_SHR_U); }
+              c.i64Const(0xffn); c.op(OP.I64_AND);
+              if (dstBit > 0) { c.i64Const(BigInt(dstBit)); c.op(OP.I64_SHL); }
+              c.op(OP.I64_OR);
+            }
           }
         } else {
           c.getReg(rn, false, !is64);

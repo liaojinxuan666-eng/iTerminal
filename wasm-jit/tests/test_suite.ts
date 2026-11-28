@@ -1035,6 +1035,45 @@ async function testSysregAndLdarStlr() {
   console.log(`[PASS] Test 20 (DCZID_EL0 + PRFM + STLR/LDAR): 0xd53b00e5=0x10, LDAR=0xbeef`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 21: Musl mallocng RBIT + CLZ (a_ctz_32 / a_ctz_64) & REV16/REV32
+// ---------------------------------------------------------------------------
+async function testRbitCtzRev() {
+  const code = [
+    // a_ctz_32(1) -> rbit w4, w6; clz w4, w4 -> expect 0!
+    A64.movz(6, 1),
+    0x5ac000c4, // rbit w4, w6
+    0x5ac01084, // clz w4, w4
+    A64.movReg(19, 4),
+    // a_ctz_32(0x10) -> expect 4!
+    A64.movz(6, 0x10),
+    0x5ac000c4, // rbit w4, w6
+    0x5ac01084, // clz w4, w4
+    A64.movReg(20, 4),
+    // a_ctz_64(1 << 40) -> rbit x5, x7; clz x5, x5 -> expect 40!
+    A64.movz(7, 0x0100, 2), // 1 << 40
+    0xdac000e5, // rbit x5, x7
+    0xdac010a5, // clz x5, x5
+    A64.movReg(21, 5),
+    // REV16 w8, w9: 0x12345678 -> 0x34127856
+    A64.movz(9, 0x5678, 0), A64.movk(9, 0x1234, 1),
+    0x5ac00528, // rev16 w8, w9
+    A64.movReg(22, 8),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 0n, 'a_ctz_32(1) must be 0');
+  assert.strictEqual(proc.cpu.getReg(20), 4n, 'a_ctz_32(0x10) must be 4');
+  assert.strictEqual(proc.cpu.getReg(21), 40n, 'a_ctz_64(1<<40) must be 40');
+  assert.strictEqual(proc.cpu.getReg(22), 0x34127856n, 'REV16 mismatch');
+  console.log(`[PASS] Test 21 (Musl mallocng RBIT+CLZ & REV16): ctz32(1)=0, ctz32(16)=4, ctz64(1<<40)=40`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1056,7 +1095,8 @@ async function testSysregAndLdarStlr() {
   await testLdMuslRegression();
   await testMuslMemsetDup();
   await testSysregAndLdarStlr();
-  console.log('\nALL 20 TESTS PASSED.');
+  await testRbitCtzRev();
+  console.log('\nALL 21 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);
