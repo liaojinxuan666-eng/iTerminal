@@ -3,6 +3,8 @@ import { DirEntry, MemFS, normalizePath } from './vfs-memfs';
 
 const PAGE_SIZE = 4096;
 const AT_FDCWD = -100;
+const UTF8_ENC = UTF8_ENC;
+const UTF8_DEC = UTF8_DEC;
 
 export const SYS = {
   GETCWD: 17,
@@ -12,6 +14,8 @@ export const SYS = {
   MKDIRAT: 34,
   UNLINKAT: 35,
   SYMLINKAT: 36,
+  STATFS: 43,
+  FSTATFS: 44,
   FACCESSAT: 48,
   CHDIR: 49,
   OPENAT: 56,
@@ -36,6 +40,7 @@ export const SYS = {
   SET_ROBUST_LIST: 99,
   NANOSLEEP: 101,
   CLOCK_GETTIME: 113,
+  CLOCK_GETRES: 114,
   KILL: 129,
   TKILL: 130,
   TGKILL: 131,
@@ -54,6 +59,7 @@ export const SYS = {
   GETGID: 176,
   GETEGID: 177,
   GETTID: 178,
+  SYSINFO: 179,
   SOCKET: 198,
   CONNECT: 203,
   SENDTO: 206,
@@ -152,7 +158,7 @@ interface MappingRecord {
 }
 
 type FdEntry =
-  | { kind: 'stdin' | 'stdout' | 'stderr'; isTty: boolean; path?: undefined; pipe?: undefined; sockId?: undefined }
+  | { kind: 'stdin' | 'stdout' | 'stderr' | 'dev_null' | 'dev_zero' | 'dev_random'; isTty: boolean; path?: undefined; pipe?: undefined; sockId?: undefined }
   | { kind: 'file' | 'dir'; path: string; offset: number; dirEntries: DirEntry[] | null; dirIdx: number; isTty?: false; pipe?: undefined; sockId?: undefined }
   | { kind: 'pipe_r' | 'pipe_w'; pipe: PipeBuffer; isTty?: false; path?: undefined; sockId?: undefined }
   | { kind: 'socket'; domain: number; type: number; proto: number; sockId: number | null; isTty?: false; path?: undefined; pipe?: undefined };
@@ -309,7 +315,7 @@ export function setupInitialStack(
   envp: string[] = ['PATH=/bin:/usr/bin'],
   auxvExtras: [number, number][] = []
 ): number {
-  const enc = new TextEncoder();
+  const enc = UTF8_ENC;
   let sp = stackTop >>> 0;
   cpu.ensureMemory(sp + 0x1000);
 
@@ -367,7 +373,7 @@ export function setupInitialStack(
 function readCString(u8: Uint8Array, ptr: number, maxLen = 4096): string {
   let end = ptr;
   while (end < u8.length && end - ptr < maxLen && u8[end] !== 0) end++;
-  return new TextDecoder().decode(u8.subarray(ptr, end));
+  return UTF8_DEC.decode(u8.subarray(ptr, end));
 }
 
 function readCStringArray(cpu: GuestCPU, arrPtr: number, maxCount = 256): string[] {
@@ -646,11 +652,57 @@ export class GuestKernel {
       case SYS.MADVISE:
       case SYS.FUTEX:
       case SYS.MPROTECT:
-      case SYS.FCNTL:
       case SYS.RT_SIGPROCMASK:
       case SYS.SETSOCKOPT:
       case SYS.GETSOCKOPT:
         return ret(0);
+
+      case SYS.FCNTL: {
+        const fdObj = proc.fds.get(a0);
+        if (!fdObj) return ret(-ERRNO.EBADF);
+        const cmd = a1;
+        // F_DUPFD (0) / F_DUPFD_CLOEXEC (1030) — CRITICAL for busybox ash FD redirections!
+        if (cmd === 0 || cmd === 1030) {
+          let newFd = Math.max(0, a2 | 0);
+          while (proc.fds.has(newFd)) newFd++;
+          if (fdObj.kind === 'pipe_r') fdObj.pipe.readers++;
+          if (fdObj.kind === 'pipe_w') fdObj.pipe.writers++;
+          proc.fds.set(newFd, { ...fdObj });
+          if (newFd >= proc.nextFd) proc.nextFd = newFd + 1;
+          return ret(newFd);
+        }
+        return ret(0);
+      }
+
+      case SYS.CLOCK_GETRES: {
+        if (a1) {
+          cpu.view.setBigInt64(a1, 0n, true);
+          cpu.view.setBigInt64(a1 + 8, 1000000n, true);
+        }
+        return ret(0);
+      }
+
+      case SYS.SYSINFO: {
+        cpu.u8.fill(0, a0, a0 + 112);
+        cpu.view.setBigInt64(a0 + 0, BigInt(Math.floor(Date.now() / 1000)), true);
+        cpu.view.setBigUint64(a0 + 32, 512n * 1024n * 1024n, true); // totalram
+        cpu.view.setBigUint64(a0 + 40, 256n * 1024n * 1024n, true); // freeram
+        cpu.view.setUint16(a0 + 80, this.processes.size, true);     // procs
+        cpu.view.setUint32(a0 + 104, 1, true);                      // mem_unit
+        return ret(0);
+      }
+
+      case SYS.STATFS:
+      case SYS.FSTATFS: {
+        const bufPtr = a1;
+        cpu.u8.fill(0, bufPtr, bufPtr + 120);
+        cpu.view.setBigInt64(bufPtr + 0, 0x01021994n, true); // TMPFS_MAGIC
+        cpu.view.setBigInt64(bufPtr + 8, 4096n, true);       // f_bsize
+        cpu.view.setBigUint64(bufPtr + 16, 65536n, true);    // f_blocks
+        cpu.view.setBigUint64(bufPtr + 24, 32768n, true);    // f_bfree
+        cpu.view.setBigUint64(bufPtr + 32, 32768n, true);    // f_bavail
+        return ret(0);
+      }
 
       case SYS.BRK: return ret(proc.vmm.brk(cpu, a0));
       case SYS.MUNMAP: return ret(proc.vmm.munmap(a0, a1));
@@ -662,7 +714,9 @@ export class GuestKernel {
         const fd = a4 | 0;
         if ((a3 & MAP_ANONYMOUS) === 0 && fd >= 0) {
           const fdObj = proc.fds.get(fd);
-          if (!fdObj || fdObj.kind !== 'file') return ret(-ERRNO.EBADF);
+          if (!fdObj) return ret(-ERRNO.EBADF);
+        if (fdObj.kind === 'dir') { if (a1 === 0 && a2 === 0) fdObj.dirIdx = 0; return ret(fdObj.dirIdx); }
+        if (fdObj.kind !== 'file') return ret(-ERRNO.EBADF);
           const fileData = this.fs.readFile(fdObj.path) || new Uint8Array(0);
           const fileOff = a5 >>> 0;
           if (fileOff < fileData.length) {
@@ -769,7 +823,7 @@ export class GuestKernel {
       }
 
       case SYS.GETCWD: {
-        const bytes = new TextEncoder().encode(proc.cwd + '\0');
+        const bytes = UTF8_ENC.encode(proc.cwd + '\0');
         if (bytes.length > a1) return ret(-ERRNO.EINVAL);
         cpu.u8.set(bytes, a0);
         return ret(a0);
@@ -815,7 +869,7 @@ export class GuestKernel {
             ? proc.exePath
             : this.fs.readlink(full);
         if (!target) return ret(-ERRNO.ENOENT);
-        const bytes = new TextEncoder().encode(target);
+        const bytes = UTF8_ENC.encode(target);
         const n = Math.min(a3, bytes.length);
         cpu.u8.set(bytes.subarray(0, n), a2);
         return ret(n);
@@ -823,18 +877,45 @@ export class GuestKernel {
 
       case SYS.OPENAT: {
         const full = this._resolvePathAt(proc, a0, readCString(cpu.u8, a1));
+        if (full === '/dev/null') {
+          const fd = proc.nextFd++;
+          proc.fds.set(fd, { kind: 'dev_null', isTty: false });
+          return ret(fd);
+        }
+        if (full === '/dev/zero') {
+          const fd = proc.nextFd++;
+          proc.fds.set(fd, { kind: 'dev_zero', isTty: false });
+          return ret(fd);
+        }
+        if (full === '/dev/urandom' || full === '/dev/random') {
+          const fd = proc.nextFd++;
+          proc.fds.set(fd, { kind: 'dev_random', isTty: false });
+          return ret(fd);
+        }
+        if (full === '/dev/tty') {
+          const fd = proc.nextFd++;
+          proc.fds.set(fd, { kind: 'stdin', isTty: true });
+          return ret(fd);
+        }
         const O_CREAT = 0o100;
+        const O_TRUNC = 0o1000;
+        const O_APPEND = 0o2000;
         let st = this.fs.stat(full);
         if (!st && (a2 & O_CREAT) !== 0) {
           this.fs.writeFile(full, new Uint8Array(0));
           st = this.fs.stat(full);
         }
         if (!st) return ret(-ERRNO.ENOENT);
+        const resolved = this.fs.resolveSymlinks(full);
+        if (!st.isDir && (a2 & O_TRUNC) !== 0) {
+          this.fs.writeFile(resolved, new Uint8Array(0));
+          st = this.fs.stat(resolved)!;
+        }
         const fd = proc.nextFd++;
         proc.fds.set(fd, {
           kind: st.isDir ? 'dir' : 'file',
-          path: this.fs.resolveSymlinks(full),
-          offset: 0,
+          path: resolved,
+          offset: !st.isDir && (a2 & O_APPEND) !== 0 ? st.size : 0,
           dirEntries: st.isDir ? this.fs.listDir(full) : null,
           dirIdx: 0,
         });
@@ -866,7 +947,7 @@ export class GuestKernel {
         const fdObj = proc.fds.get(a0);
         if (!fdObj || fdObj.kind !== 'dir') return ret(-ERRNO.ENOTDIR);
         const entries = fdObj.dirEntries || [];
-        const enc = new TextEncoder();
+        const enc = UTF8_ENC;
         const dv = cpu.view;
         let written = 0;
         while (fdObj.dirIdx < entries.length) {
@@ -912,7 +993,7 @@ export class GuestKernel {
 
       case SYS.UNAME: {
         const fields = ['Linux', 'iterminal', '6.1.0-wasm-jit', '#1 SMP', 'aarch64', 'local'];
-        const enc = new TextEncoder();
+        const enc = UTF8_ENC;
         cpu.u8.fill(0, a0, a0 + 65 * 6);
         for (let i = 0; i < fields.length; i++) cpu.u8.set(enc.encode(fields[i]), a0 + i * 65);
         return ret(0);
@@ -922,9 +1003,13 @@ export class GuestKernel {
         const fdObj = proc.fds.get(a0);
         if (!fdObj) return ret(-ERRNO.EBADF);
         const bytes = cpu.u8.slice(a1, a1 + a2);
+        if (fdObj.kind === 'dev_null' || fdObj.kind === 'dev_zero' || fdObj.kind === 'dev_random') return ret(bytes.length);
         if (fdObj.kind === 'stdout') { this.host.onStdout(bytes); return ret(bytes.length); }
         if (fdObj.kind === 'stderr') { this.host.onStderr(bytes); return ret(bytes.length); }
         if (fdObj.kind === 'pipe_w') return ret(fdObj.pipe.write(bytes));
+        if (fdObj.kind === 'dev_null') return ret(0);
+        if (fdObj.kind === 'dev_zero') { cpu.u8.fill(0, a1, a1 + a2); return ret(a2); }
+        if (fdObj.kind === 'dev_random') { for (let i = 0; i < a2; i++) cpu.u8[a1 + i] = (Math.random() * 256) | 0; return ret(a2); }
         if (fdObj.kind === 'file') {
           const cur = this.fs.readFile(fdObj.path) || new Uint8Array(0);
           const merged = new Uint8Array(Math.max(cur.length, fdObj.offset + bytes.length));

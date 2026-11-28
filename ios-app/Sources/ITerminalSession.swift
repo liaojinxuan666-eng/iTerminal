@@ -118,6 +118,12 @@ public final class ITerminalSession: ObservableObject, GuestHostDelegate {
         bridge.sendInterrupt(signal: 2)
     }
 
+    public func resetRootFS() {
+        try? FileManager.default.removeItem(at: snapshotURL)
+        outputLog = "[iTerminal] Cleared saved RootFS snapshot. Re-mounting fresh Alpine rootfs...\n"
+        mountAndBootDefaultShell()
+    }
+
     public func persistRootFS() {
         bridge.saveRootFS(to: snapshotURL)
     }

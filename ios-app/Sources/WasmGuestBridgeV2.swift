@@ -48,6 +48,10 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
 
     public override init() { super.init() }
 
+    deinit {
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "iosHost")
+    }
+
     public func setup(
         runtimeJS: String,
         completion: @escaping (Error?) -> Void

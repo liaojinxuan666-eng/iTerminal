@@ -16,6 +16,13 @@ struct TerminalView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer()
+                    Button("Reset FS") {
+                        session.resetRootFS()
+                    }
+                    .font(.system(.caption2, design: .monospaced))
+                    .buttonStyle(.bordered)
+                    .tint(.orange)
+
                     Button("Boot sh") {
                         session.bootShell()
                     }

@@ -1128,6 +1128,75 @@ async function testMoviAndSimdBitwise() {
   console.log(`[PASS] Test 23 (BusyBox ash MOVI + SIMD EOR): 0x4f00e440=0x0202020202020202`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 24: SIMD STR/STUR Q0 vs GP STR X0 Mask Isolation (V=1 bit 26)
+// ---------------------------------------------------------------------------
+async function testSimdStrQNotHijackedByGP() {
+  const code = [
+    A64.subImm(31, 31, 64),
+    // Put distinct sentinel in X0 (0xDEAD) and distinct value in Q0 (0x00)
+    A64.movz(0, 0xdead),
+    0x4f00e400, // MOVI V0.16B, #0 -> Q0 = 0
+    // STR Q0, [sp, #0] (0x3d8003e0) — must write 0, NOT 0xDEAD!
+    0x3d8003e0,
+    // STUR Q0, [sp, #16] (0x3c8103e0) — must write 0, NOT 0xDEAD!
+    0x3c8103e0,
+    A64.ldr64(19, 31, 0),
+    A64.ldr64(20, 31, 16),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 0n, 'STR Q0 was hijacked by GP STR X0!');
+  assert.strictEqual(proc.cpu.getReg(20), 0n, 'STUR Q0 was hijacked by GP STUR X0!');
+  console.log(`[PASS] Test 24 (SIMD STR/STUR Q0 Mask Isolation): Q0=0 stored cleanly (X0=0xdead untouched)`);
+}
+
+
+// ---------------------------------------------------------------------------
+// Test 25: PRFM Non-Clobber + FCNTL F_DUPFD_CLOEXEC + /dev/null + O_TRUNC
+// ---------------------------------------------------------------------------
+async function testAuditHardening() {
+  const sNull = new TextEncoder().encode('/dev/null\0');
+  const code = [
+    // 1. PRFM PLDL1KEEP, [sp] must NOT clobber X0!
+    A64.movz(0, 0x5a5a),
+    0xf98003e0, // PRFM PLDL1KEEP, [sp]
+    A64.movReg(19, 0), // expect 0x5a5a!
+    // 2. fcntl(1, F_DUPFD_CLOEXEC=1030, 10) -> expect new fd == 10!
+    A64.movz(0, 1), A64.movz(1, 1030), A64.movz(2, 10), A64.movz(8, SYS.FCNTL), A64.svc(0),
+    A64.movReg(20, 0),
+    // 3. openat(-100, "/dev/null", 0, 0) -> read returns 0 (EOF)
+    A64.movn(0, 99),
+    A64.movz(1, 0, 0), // patched
+    A64.movk(1, 0, 1),
+    A64.movz(2, 0), A64.movz(3, 0), A64.movz(8, SYS.OPENAT), A64.svc(0),
+    A64.subImm(31, 31, 32),
+    A64.addImm(1, 31, 0), A64.movz(2, 16), A64.movz(8, SYS.READ), A64.svc(0),
+    A64.movReg(21, 0), // expect 0
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const baseVaddr = 0x10000;
+  const dataOff = (code.length * 4 + 15) & ~15;
+  const sNullAddr = baseVaddr + dataOff;
+  code[10] = A64.movz(1, sNullAddr & 0xffff, 0);
+  code[11] = A64.movk(1, (sNullAddr >>> 16) & 0xffff, 1);
+
+  const { elf } = buildELF64(code, sNull, baseVaddr);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 0x5a5an, 'PRFM clobbered X0!');
+  assert.strictEqual(proc.cpu.getReg(20), 10n, 'FCNTL F_DUPFD_CLOEXEC did not return fd>=10');
+  assert.strictEqual(proc.cpu.getReg(21), 0n, '/dev/null read should return 0');
+  console.log(`[PASS] Test 25 (Audit Hardening): PRFM safe, F_DUPFD_CLOEXEC=10, /dev/null=EOF`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1152,7 +1221,9 @@ async function testMoviAndSimdBitwise() {
   await testRbitCtzRev();
   await testUmovFmovSimd();
   await testMoviAndSimdBitwise();
-  console.log('\nALL 23 TESTS PASSED.');
+  await testSimdStrQNotHijackedByGP();
+  await testAuditHardening();
+  console.log('\nALL 25 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

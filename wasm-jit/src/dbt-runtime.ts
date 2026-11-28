@@ -214,7 +214,7 @@ function buildDispatcherModule(memMinPages = 16, tableMin = 1024): WebAssembly.M
   return new WebAssembly.Module(mb.toUint8Array() as BufferSource);
 }
 
-export function translateBasicBlock(memView: DataView, startPC: number, maxInsns = 64): WebAssembly.Module {
+export function translateBasicBlock(memView: DataView, startPC: number, maxInsns = 128): WebAssembly.Module {
   const mb = new ModuleBuilder();
   const tSyscall = mb.addType([], [VALTYPE.I32]);
   const tBlock = mb.addType([], [VALTYPE.I32]);
@@ -744,6 +744,66 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       continue;
     }
 
+    // 39. System registers (DCZID_EL0, CTR_EL0, CNTFRQ_EL0, CNTVCT_EL0, FPCR/FPSR), PRFM prefetch, & cache ops
+    if (((insn & 0xffffffe0) >>> 0) === 0xd53b00e0) {
+      // MRS Xt, DCZID_EL0 -> return 0x10 (DZP=1: disable DC ZVA, use STP Q loop in musl memset!)
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(0x10n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (((insn & 0xffffffe0) >>> 0) === 0xd53b0020) {
+      // MRS Xt, CTR_EL0 (64-byte cache lines)
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(0x84448004n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (((insn & 0xffffffe0) >>> 0) === 0xd53be000) {
+      // MRS Xt, CNTFRQ_EL0 (24 MHz)
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(24000000n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (
+      ((insn & 0xffffffe0) >>> 0) === 0xd53be040 || // CNTVCT_EL0
+      ((insn & 0xffffffe0) >>> 0) === 0xd53b4400 || // FPCR
+      ((insn & 0xffffffe0) >>> 0) === 0xd53b4420    // FPSR
+    ) {
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(0n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (
+      ((insn & 0xffffffe0) >>> 0) === 0xd51b4400 || // MSR FPCR
+      ((insn & 0xffffffe0) >>> 0) === 0xd51b4420 || // MSR FPSR
+      ((insn & 0xffff8000) >>> 0) === 0xd50b0000 || // DC/IC cache maintenance (NOP)
+      ((insn & 0xffc00000) >>> 0) === 0xf9800000 || // PRFM unsigned imm
+      ((insn & 0xff000000) >>> 0) === 0xd8000000 || // PRFM literal
+      ((insn & 0xffe00c00) >>> 0) === 0xf8800000 || // PRFM unscaled
+      ((insn & 0xffe00c00) >>> 0) === 0xf8a00800    // PRFM reg
+    ) {
+      pc = nextPC;
+      continue;
+    }
+
+    // 40. Load-Acquire (LDAR/LDARB/LDARH) & Store-Release (STLR/STLRB/STLRH) — used by musl mallocng
+    if (((insn & 0x3ffffc00) >>> 0) === 0x08dffc00 || ((insn & 0x3ffffc00) >>> 0) === 0x089ffc00) {
+      const size = (insn >>> 30) & 0x3;
+      const isLoad = ((insn >>> 22) & 1) === 1;
+      const rn = (insn >>> 5) & 0x1f;
+      const rt = insn & 0x1f;
+      c.getReg(rn, true, false);
+      c.op(OP.I32_WRAP_I64);
+      c.localSet(3);
+      emitLoadStoreAtLocal3(c, size, isLoad ? 1 : 0, rt);
+      pc = nextPC;
+      continue;
+    }
+
+
     // 20. Load/Store Exclusive (LDXR/LDAXR/STXR/STLXR) for musl atomics
     if (((insn & 0x3f200000) >>> 0) === 0x08000000) {
       const size = (insn >>> 30) & 0x3;
@@ -769,7 +829,7 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
     }
 
     // 21. Load/Store unsigned immediate
-    if (((insn & 0x3b000000) >>> 0) === 0x39000000) {
+    if (((insn & 0x3f000000) >>> 0) === 0x39000000) {
       const size = (insn >>> 30) & 0x3;
       const opc = (insn >>> 22) & 0x3;
       const imm12 = (insn >>> 10) & 0xfff;
@@ -782,9 +842,9 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
 
     // 22. Load/Store unscaled (LDUR/STUR), post-index, and pre-index
     if (
-      ((insn & 0x3b200c00) >>> 0) === 0x38000000 ||
-      ((insn & 0x3b200c00) >>> 0) === 0x38000400 ||
-      ((insn & 0x3b200c00) >>> 0) === 0x38000c00
+      ((insn & 0x3f200c00) >>> 0) === 0x38000000 ||
+      ((insn & 0x3f200c00) >>> 0) === 0x38000400 ||
+      ((insn & 0x3f200c00) >>> 0) === 0x38000c00
     ) {
       const size = (insn >>> 30) & 0x3;
       const opc = (insn >>> 22) & 0x3;
@@ -815,7 +875,7 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
     }
 
     // 23. Load/Store register offset
-    if (((insn & 0x3b200c00) >>> 0) === 0x38200800) {
+    if (((insn & 0x3f200c00) >>> 0) === 0x38200800) {
       const size = (insn >>> 30) & 0x3;
       const opc = (insn >>> 22) & 0x3;
       const rm = (insn >>> 16) & 0x1f;
@@ -898,7 +958,7 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
 
 
     // 25. LDR (literal) 32-bit / 64-bit / LDRSW (PC-relative constant pool)
-    if (((insn & 0x3b000000) >>> 0) === 0x18000000) {
+    if (((insn & 0x3f000000) >>> 0) === 0x18000000) {
       const opc = (insn >>> 30) & 0x3; // 0=32u, 1=64, 2=32s
       const imm19 = signExtend((insn >>> 5) & 0x7ffff, 19);
       const rt = insn & 0x1f;
@@ -1453,65 +1513,6 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
     }
 
 
-    // 39. System registers (DCZID_EL0, CTR_EL0, CNTFRQ_EL0, CNTVCT_EL0, FPCR/FPSR), PRFM prefetch, & cache ops
-    if (((insn & 0xffffffe0) >>> 0) === 0xd53b00e0) {
-      // MRS Xt, DCZID_EL0 -> return 0x10 (DZP=1: disable DC ZVA, use STP Q loop in musl memset!)
-      const rt = insn & 0x1f;
-      if (c.beginSetReg(rt, false)) { c.i64Const(0x10n); c.endSetReg(rt, false, false); }
-      pc = nextPC;
-      continue;
-    }
-    if (((insn & 0xffffffe0) >>> 0) === 0xd53b0020) {
-      // MRS Xt, CTR_EL0 (64-byte cache lines)
-      const rt = insn & 0x1f;
-      if (c.beginSetReg(rt, false)) { c.i64Const(0x84448004n); c.endSetReg(rt, false, false); }
-      pc = nextPC;
-      continue;
-    }
-    if (((insn & 0xffffffe0) >>> 0) === 0xd53be000) {
-      // MRS Xt, CNTFRQ_EL0 (24 MHz)
-      const rt = insn & 0x1f;
-      if (c.beginSetReg(rt, false)) { c.i64Const(24000000n); c.endSetReg(rt, false, false); }
-      pc = nextPC;
-      continue;
-    }
-    if (
-      ((insn & 0xffffffe0) >>> 0) === 0xd53be040 || // CNTVCT_EL0
-      ((insn & 0xffffffe0) >>> 0) === 0xd53b4400 || // FPCR
-      ((insn & 0xffffffe0) >>> 0) === 0xd53b4420    // FPSR
-    ) {
-      const rt = insn & 0x1f;
-      if (c.beginSetReg(rt, false)) { c.i64Const(0n); c.endSetReg(rt, false, false); }
-      pc = nextPC;
-      continue;
-    }
-    if (
-      ((insn & 0xffffffe0) >>> 0) === 0xd51b4400 || // MSR FPCR
-      ((insn & 0xffffffe0) >>> 0) === 0xd51b4420 || // MSR FPSR
-      ((insn & 0xffff8000) >>> 0) === 0xd50b0000 || // DC/IC cache maintenance (NOP)
-      ((insn & 0xffc00000) >>> 0) === 0xf9800000 || // PRFM unsigned imm
-      ((insn & 0xff000000) >>> 0) === 0xd8000000 || // PRFM literal
-      ((insn & 0xffe00c00) >>> 0) === 0xf8800000 || // PRFM unscaled
-      ((insn & 0xffe00c00) >>> 0) === 0xf8a00800    // PRFM reg
-    ) {
-      pc = nextPC;
-      continue;
-    }
-
-    // 40. Load-Acquire (LDAR/LDARB/LDARH) & Store-Release (STLR/STLRB/STLRH) — used by musl mallocng
-    if (((insn & 0x3ffffc00) >>> 0) === 0x08dffc00 || ((insn & 0x3ffffc00) >>> 0) === 0x089ffc00) {
-      const size = (insn >>> 30) & 0x3;
-      const isLoad = ((insn >>> 22) & 1) === 1;
-      const rn = (insn >>> 5) & 0x1f;
-      const rt = insn & 0x1f;
-      c.getReg(rn, true, false);
-      c.op(OP.I32_WRAP_I64);
-      c.localSet(3);
-      emitLoadStoreAtLocal3(c, size, isLoad ? 1 : 0, rt);
-      pc = nextPC;
-      continue;
-    }
-
     // 41. SIMD UMOV Wd/Xd, Vn.<B/H/S/D>[idx] — e.g. 0x4E083C01 = UMOV X1, V0.D[0] (musl memset!)
     if (((insn & 0xbfe0fc00) >>> 0) === 0x0e003c00) {
       const is64 = (insn >>> 30) === 1;
@@ -1850,12 +1851,27 @@ export class GuestCPU {
     this.runSliceWasm = this.dispatcherInstance.exports.run_slice as (budget: number) => number;
   }
 
+  private _cachedBuf: ArrayBuffer | null = null;
+  private _cachedView: DataView | null = null;
+  private _cachedU8: Uint8Array | null = null;
+
+  private _refreshViews(): void {
+    const buf = this.memory.buffer;
+    if (this._cachedBuf !== buf) {
+      this._cachedBuf = buf;
+      this._cachedView = new DataView(buf);
+      this._cachedU8 = new Uint8Array(buf);
+    }
+  }
+
   get view(): DataView {
-    return new DataView(this.memory.buffer);
+    this._refreshViews();
+    return this._cachedView!;
   }
 
   get u8(): Uint8Array {
-    return new Uint8Array(this.memory.buffer);
+    this._refreshViews();
+    return this._cachedU8!;
   }
 
   getReg(r: number): bigint {
