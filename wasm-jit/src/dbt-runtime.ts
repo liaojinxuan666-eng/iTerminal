@@ -1426,6 +1426,125 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       pc = nextPC;
       continue;
     }
+
+    // 41. SIMD UMOV Wd/Xd, Vn.<B/H/S/D>[idx] — e.g. 0x4E083C01 = UMOV X1, V0.D[0] (musl memset!)
+    if (((insn & 0xbfe0fc00) >>> 0) === 0x0e003c00) {
+      const is64 = (insn >>> 30) === 1;
+      const imm5 = (insn >>> 16) & 0x1f;
+      const rn = (insn >>> 5) & 0x1f;
+      const rd = insn & 0x1f;
+      if (c.beginSetReg(rd, false)) {
+        let byteOff = 0;
+        let width = 8;
+        if ((imm5 & 1) === 1) { width = 1; byteOff = imm5 >>> 1; }
+        else if ((imm5 & 3) === 2) { width = 2; byteOff = (imm5 >>> 2) * 2; }
+        else if ((imm5 & 7) === 4) { width = 4; byteOff = (imm5 >>> 3) * 4; }
+        else if ((imm5 & 15) === 8) { width = 8; byteOff = (imm5 >>> 4) * 8; }
+        c.i32Const(OFF_Q(rn) + byteOff);
+        if (width === 1) c.op(OP.I64_LOAD8_U, 0, 0);
+        else if (width === 2) c.op(OP.I64_LOAD16_U, 1, 0);
+        else if (width === 4) c.op(OP.I64_LOAD32_U, 2, 0);
+        else c.loadI64(0, 3);
+        c.endSetReg(rd, false, !is64);
+      }
+      pc = nextPC;
+      continue;
+    }
+
+    // 42. SIMD INS Vd.<B/H/S/D>[idx], Rn
+    if (((insn & 0xbfe0fc00) >>> 0) === 0x4e001c00) {
+      const imm5 = (insn >>> 16) & 0x1f;
+      const rn = (insn >>> 5) & 0x1f;
+      const vd = insn & 0x1f;
+      let byteOff = 0;
+      let width = 8;
+      if ((imm5 & 1) === 1) { width = 1; byteOff = imm5 >>> 1; }
+      else if ((imm5 & 3) === 2) { width = 2; byteOff = (imm5 >>> 2) * 2; }
+      else if ((imm5 & 7) === 4) { width = 4; byteOff = (imm5 >>> 3) * 4; }
+      else if ((imm5 & 15) === 8) { width = 8; byteOff = (imm5 >>> 4) * 8; }
+      c.i32Const(OFF_Q(vd) + byteOff);
+      c.getReg(rn, false, width <= 4);
+      if (width === 1) c.op(OP.I64_STORE8, 0, 0);
+      else if (width === 2) c.op(OP.I64_STORE16, 1, 0);
+      else if (width === 4) c.op(OP.I64_STORE32, 2, 0);
+      else c.storeI64(0, 3);
+      pc = nextPC;
+      continue;
+    }
+
+    // 43. FMOV GP <-> FP/SIMD (32-bit S & 64-bit D)
+    if (((insn & 0x7f3ffc00) >>> 0) === 0x1e260000) {
+      // FMOV Wd, Sn (0x1e260000) / FMOV Xd, Dn (0x9e660000)
+      const is64 = (insn >>> 31) === 1;
+      const rn = (insn >>> 5) & 0x1f;
+      const rd = insn & 0x1f;
+      if (c.beginSetReg(rd, false)) {
+        c.i32Const(OFF_Q(rn));
+        if (is64) c.loadI64(0, 3);
+        else c.op(OP.I64_LOAD32_U, 2, 0);
+        c.endSetReg(rd, false, !is64);
+      }
+      pc = nextPC;
+      continue;
+    }
+    if (((insn & 0x7f3ffc00) >>> 0) === 0x1e270000) {
+      // FMOV Sd, Wn (0x1e270000) / FMOV Dd, Xn (0x9e670000)
+      const is64 = (insn >>> 31) === 1;
+      const rn = (insn >>> 5) & 0x1f;
+      const rd = insn & 0x1f;
+      c.i32Const(OFF_Q(rd));
+      c.getReg(rn, false, !is64);
+      c.storeI64(0, 3);
+      c.i32Const(OFF_Q(rd) + 8);
+      c.i64Const(0n);
+      c.storeI64(0, 3);
+      pc = nextPC;
+      continue;
+    }
+
+    // 44. SIMD ORR Vd.16B/8B, Vn, Vm (includes MOV Vd.16B, Vn.16B)
+    if (((insn & 0xbfe0fc00) >>> 0) === 0x0ea01c00) {
+      const isQ = (insn >>> 30) === 1;
+      const rm = (insn >>> 16) & 0x1f;
+      const rn = (insn >>> 5) & 0x1f;
+      const vd = insn & 0x1f;
+      c.i32Const(OFF_Q(vd));
+      c.i32Const(OFF_Q(rn)); c.loadI64(0, 3);
+      c.i32Const(OFF_Q(rm)); c.loadI64(0, 3);
+      c.op(OP.I64_OR);
+      c.storeI64(0, 3);
+      c.i32Const(OFF_Q(vd) + 8);
+      if (isQ) {
+        c.i32Const(OFF_Q(rn) + 8); c.loadI64(0, 3);
+        c.i32Const(OFF_Q(rm) + 8); c.loadI64(0, 3);
+        c.op(OP.I64_OR);
+      } else {
+        c.i64Const(0n);
+      }
+      c.storeI64(0, 3);
+      pc = nextPC;
+      continue;
+    }
+
+    // 45. FP/SIMD 32-bit S-reg LDR/STR unsigned offset (0xBD000000 / 0xBD400000)
+    if (((insn & 0xff800000) >>> 0) === 0xbd000000 || ((insn & 0xff800000) >>> 0) === 0xbd400000) {
+      const isLoad = ((insn >>> 22) & 1) === 1;
+      const imm12 = (insn >>> 10) & 0xfff;
+      const rn = (insn >>> 5) & 0x1f;
+      const st = insn & 0x1f;
+      c.getReg(rn, true, false);
+      if (imm12 > 0) { c.i64Const(BigInt(imm12 * 4)); c.op(OP.I64_ADD); }
+      c.op(OP.I32_WRAP_I64);
+      c.localSet(3);
+      if (isLoad) {
+        c.i32Const(OFF_Q(st)); c.localGet(3); c.op(OP.I64_LOAD32_U, 2, 0); c.storeI64(0, 3);
+        c.i32Const(OFF_Q(st) + 8); c.i64Const(0n); c.storeI64(0, 3);
+      } else {
+        c.localGet(3); c.i32Const(OFF_Q(st)); c.loadI32(0, 2); c.storeI32(0, 2);
+      }
+      pc = nextPC;
+      continue;
+    }
     // Unrecognized instruction -> fault
     c.setPC(pc);
     c.i32Const(STATUS.FAULT);

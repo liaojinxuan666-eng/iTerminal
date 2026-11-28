@@ -1074,6 +1074,34 @@ async function testRbitCtzRev() {
   console.log(`[PASS] Test 21 (Musl mallocng RBIT+CLZ & REV16): ctz32(1)=0, ctz32(16)=4, ctz64(1<<40)=40`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 22: Real-Device BusyBox/musl UMOV (0x4e083c01) + FMOV + SIMD ORR
+// ---------------------------------------------------------------------------
+async function testUmovFmovSimd() {
+  const code = [
+    // Fill V0 with 0xCD via DUP V0.16B, W1 (0x4e010c20), then UMOV X1, V0.D[0] (0x4e083c01)
+    A64.movz(1, 0xcd),
+    0x4e010c20, // DUP V0.16B, W1
+    A64.movz(1, 0),
+    0x4e083c01, // exact iPhone opcode at PC=0x413e88: UMOV X1, V0.D[0] -> expect 0xCDCDCDCDCDCDCDCD
+    A64.movReg(19, 1),
+    // FMOV D2, X2 -> FMOV X20, D2
+    A64.movz(2, 0x1337),
+    0x9e670042, // fmov d2, x2
+    0x9e660054, // fmov x20, d2
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 0xcdcdcdcdcdcdcdcdn, 'UMOV X1, V0.D[0] mismatch');
+  assert.strictEqual(proc.cpu.getReg(20), 0x1337n, 'FMOV D/X mismatch');
+  console.log(`[PASS] Test 22 (BusyBox/musl UMOV + FMOV): 0x4e083c01 & FMOV verified`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1096,7 +1124,8 @@ async function testRbitCtzRev() {
   await testMuslMemsetDup();
   await testSysregAndLdarStlr();
   await testRbitCtzRev();
-  console.log('\nALL 21 TESTS PASSED.');
+  await testUmovFmovSimd();
+  console.log('\nALL 22 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);
