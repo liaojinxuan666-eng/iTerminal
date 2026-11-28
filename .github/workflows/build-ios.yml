@@ -24,18 +24,20 @@ jobs:
         run: node wasm-jit/tests/test_suite.js
 
   build-ios-ipa:
-    name: Build Unsigned iOS IPA (XcodeGen + xcodebuild)
+    name: Build Unsigned iOS IPA (Alpine RootFS + XcodeGen)
     needs: test-wasm-jit
     runs-on: macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Bundle wasm-jit JS runtime into ios-app Resources
+      - name: Bundle wasm-jit JS runtime & Alpine AArch64 minirootfs
         run: |
           mkdir -p ios-app/Resources/runtime
           cp wasm-jit/src/*.js ios-app/Resources/runtime/
           cp wasm-jit/runtime/guest-v2.js ios-app/Resources/runtime/
+          curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz \
+            | gunzip > ios-app/Resources/runtime/alpine-minirootfs.tar
           ls -lh ios-app/Resources/runtime/
 
       - name: Install XcodeGen
