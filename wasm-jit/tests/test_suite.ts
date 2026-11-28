@@ -1007,6 +1007,34 @@ async function testMuslMemsetDup() {
   console.log(`[PASS] Test 19 (Alpine ld-musl memset): 0x4e010c20 (DUP V0.16B, W1) verified`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 20: Real-Device Alpine ld-musl DCZID_EL0 (0xd53b00e5) + PRFM + STLR/LDAR
+// ---------------------------------------------------------------------------
+async function testSysregAndLdarStlr() {
+  const code = [
+    // Exact iPhone opcode at PC=0x413f08: 0xd53b00e5 = MRS X5, DCZID_EL0 -> expect 0x10 (DZP=1)
+    0xd53b00e5,
+    A64.movReg(19, 5),
+    // PRFM PLDL1KEEP, [sp] -> NOP
+    0xf98003e0,
+    // STLR x1, [sp] + LDAR x20, [sp]
+    A64.subImm(31, 31, 32),
+    A64.movz(1, 0xbeef),
+    0xc89fffe1, // stlr x1, [sp]
+    0xc8dffff4, // ldar x20, [sp]
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 0x10n, 'MRS DCZID_EL0 should return 0x10 (DZP=1)');
+  assert.strictEqual(proc.cpu.getReg(20), 0xbeefn, 'STLR/LDAR mismatch');
+  console.log(`[PASS] Test 20 (DCZID_EL0 + PRFM + STLR/LDAR): 0xd53b00e5=0x10, LDAR=0xbeef`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1027,7 +1055,8 @@ async function testMuslMemsetDup() {
   await testPreadAndReadv();
   await testLdMuslRegression();
   await testMuslMemsetDup();
-  console.log('\nALL 19 TESTS PASSED.');
+  await testSysregAndLdarStlr();
+  console.log('\nALL 20 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

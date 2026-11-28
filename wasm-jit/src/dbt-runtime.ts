@@ -1300,6 +1300,65 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       continue;
     }
 
+
+    // 39. System registers (DCZID_EL0, CTR_EL0, CNTFRQ_EL0, CNTVCT_EL0, FPCR/FPSR), PRFM prefetch, & cache ops
+    if (((insn & 0xffffffe0) >>> 0) === 0xd53b00e0) {
+      // MRS Xt, DCZID_EL0 -> return 0x10 (DZP=1: disable DC ZVA, use STP Q loop in musl memset!)
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(0x10n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (((insn & 0xffffffe0) >>> 0) === 0xd53b0020) {
+      // MRS Xt, CTR_EL0 (64-byte cache lines)
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(0x84448004n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (((insn & 0xffffffe0) >>> 0) === 0xd53be000) {
+      // MRS Xt, CNTFRQ_EL0 (24 MHz)
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(24000000n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (
+      ((insn & 0xffffffe0) >>> 0) === 0xd53be040 || // CNTVCT_EL0
+      ((insn & 0xffffffe0) >>> 0) === 0xd53b4400 || // FPCR
+      ((insn & 0xffffffe0) >>> 0) === 0xd53b4420    // FPSR
+    ) {
+      const rt = insn & 0x1f;
+      if (c.beginSetReg(rt, false)) { c.i64Const(0n); c.endSetReg(rt, false, false); }
+      pc = nextPC;
+      continue;
+    }
+    if (
+      ((insn & 0xffffffe0) >>> 0) === 0xd51b4400 || // MSR FPCR
+      ((insn & 0xffffffe0) >>> 0) === 0xd51b4420 || // MSR FPSR
+      ((insn & 0xffff8000) >>> 0) === 0xd50b0000 || // DC/IC cache maintenance (NOP)
+      ((insn & 0xffc00000) >>> 0) === 0xf9800000 || // PRFM unsigned imm
+      ((insn & 0xff000000) >>> 0) === 0xd8000000 || // PRFM literal
+      ((insn & 0xffe00c00) >>> 0) === 0xf8800000 || // PRFM unscaled
+      ((insn & 0xffe00c00) >>> 0) === 0xf8a00800    // PRFM reg
+    ) {
+      pc = nextPC;
+      continue;
+    }
+
+    // 40. Load-Acquire (LDAR/LDARB/LDARH) & Store-Release (STLR/STLRB/STLRH) — used by musl mallocng
+    if (((insn & 0x3ffffc00) >>> 0) === 0x08dffc00 || ((insn & 0x3ffffc00) >>> 0) === 0x089ffc00) {
+      const size = (insn >>> 30) & 0x3;
+      const isLoad = ((insn >>> 22) & 1) === 1;
+      const rn = (insn >>> 5) & 0x1f;
+      const rt = insn & 0x1f;
+      c.getReg(rn, true, false);
+      c.op(OP.I32_WRAP_I64);
+      c.localSet(3);
+      emitLoadStoreAtLocal3(c, size, isLoad ? 1 : 0, rt);
+      pc = nextPC;
+      continue;
+    }
     // Unrecognized instruction -> fault
     c.setPC(pc);
     c.i32Const(STATUS.FAULT);
