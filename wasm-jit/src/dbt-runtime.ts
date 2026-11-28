@@ -1177,11 +1177,7 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
     // opc=2 (10), V=1 (bit 26): (insn & 0xFE400000) === 0xAC000000 (STP Q) / 0xAC400000 (LDP Q)
     if (
       ((insn & 0xfe400000) >>> 0) === 0xac000000 ||
-      ((insn & 0xfe400000) >>> 0) === 0xac400000 ||
-      ((insn & 0xfe400000) >>> 0) === 0xad000000 ||
-      ((insn & 0xfe400000) >>> 0) === 0xad400000 ||
-      ((insn & 0xfe400000) >>> 0) === 0xad800000 ||
-      ((insn & 0xfe400000) >>> 0) === 0xadc00000
+      ((insn & 0xfe400000) >>> 0) === 0xac400000
     ) {
       const mode = (insn >>> 23) & 0x3; // 1=post, 2=signed-off, 3=pre
       const isLoad = ((insn >>> 22) & 1) === 1;
@@ -1404,11 +1400,7 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
     // 37. 64-bit FP/SIMD D-reg LDP/STP (opc=01, V=1: 0x6C000000..0x6DC00000)
     if (
       ((insn & 0xfe400000) >>> 0) === 0x6c000000 ||
-      ((insn & 0xfe400000) >>> 0) === 0x6c400000 ||
-      ((insn & 0xfe400000) >>> 0) === 0x6d000000 ||
-      ((insn & 0xfe400000) >>> 0) === 0x6d400000 ||
-      ((insn & 0xfe400000) >>> 0) === 0x6d800000 ||
-      ((insn & 0xfe400000) >>> 0) === 0x6dc00000
+      ((insn & 0xfe400000) >>> 0) === 0x6c400000
     ) {
       const mode = (insn >>> 23) & 0x3;
       const isLoad = ((insn >>> 22) & 1) === 1;
@@ -1559,6 +1551,66 @@ export function translateBasicBlock(memView: DataView, startPC: number, maxInsns
       else if (width === 2) { c.op(OP.I64_LOAD16_U, 1, 0); c.op(OP.I64_STORE16, 1, 0); }
       else if (width === 4) { c.op(OP.I64_LOAD32_U, 2, 0); c.op(OP.I64_STORE32, 2, 0); }
       else { c.loadI64(0, 3); c.storeI64(0, 3); }
+      pc = nextPC;
+      continue;
+    }
+
+    // 42d. SIMD SSHLL / USHLL (includes SXTL / UXTL: 0x0F20A400 = SXTL V0.2D, V0.2S!)
+    if (((insn & 0x9f80fc00) >>> 0) === 0x0f00a400) {
+      const isUnsigned = ((insn >>> 29) & 1) === 1;
+      const immh = (insn >>> 19) & 0xf;
+      const immb = (insn >>> 16) & 0x7;
+      const rn = (insn >>> 5) & 0x1f;
+      const vd = insn & 0x1f;
+      if ((immh & 0x4) !== 0) {
+        // 2S -> 2D (32-bit -> 64-bit, shift = immb + (immh - 4) * 8)
+        const shift = ((immh - 4) << 3) | immb;
+        // Load both 32-bit lanes BEFORE writing vd (handles vd === rn cleanly!)
+        c.i32Const(OFF_Q(rn));
+        c.op(isUnsigned ? OP.I64_LOAD32_U : OP.I64_LOAD32_S, 2, 0);
+        if (shift > 0) { c.i64Const(BigInt(shift)); c.op(OP.I64_SHL); }
+        c.localSet(0);
+        c.i32Const(OFF_Q(rn) + 4);
+        c.op(isUnsigned ? OP.I64_LOAD32_U : OP.I64_LOAD32_S, 2, 0);
+        if (shift > 0) { c.i64Const(BigInt(shift)); c.op(OP.I64_SHL); }
+        c.localSet(1);
+        c.i32Const(OFF_Q(vd)); c.localGet(0); c.storeI64(0, 3);
+        c.i32Const(OFF_Q(vd) + 8); c.localGet(1); c.storeI64(0, 3);
+      } else if ((immh & 0x2) !== 0) {
+        // 4H -> 4S (16-bit -> 32-bit)
+        const shift = ((immh - 2) << 3) | immb;
+        for (let i = 0; i < 4; i++) {
+          c.i32Const(OFF_Q(rn) + i * 2);
+          c.op(isUnsigned ? OP.I64_LOAD16_U : OP.I64_LOAD16_S, 1, 0);
+          if (shift > 0) { c.i64Const(BigInt(shift)); c.op(OP.I64_SHL); }
+          c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+          if (i % 2 === 0) c.localSet(i === 0 ? 0 : 1);
+          else {
+            c.i64Const(32n); c.op(OP.I64_SHL);
+            c.localGet(i === 1 ? 0 : 1); c.op(OP.I64_OR);
+            c.localSet(i === 1 ? 0 : 1);
+          }
+        }
+        c.i32Const(OFF_Q(vd)); c.localGet(0); c.storeI64(0, 3);
+        c.i32Const(OFF_Q(vd) + 8); c.localGet(1); c.storeI64(0, 3);
+      } else if ((immh & 0x1) !== 0) {
+        // 8B -> 8H (8-bit -> 16-bit)
+        const shift = immb;
+        for (let half = 0; half < 2; half++) {
+          c.i64Const(0n);
+          for (let i = 0; i < 4; i++) {
+            c.i32Const(OFF_Q(rn) + half * 4 + i);
+            c.op(isUnsigned ? OP.I64_LOAD8_U : OP.I64_LOAD8_S, 0, 0);
+            if (shift > 0) { c.i64Const(BigInt(shift)); c.op(OP.I64_SHL); }
+            c.i64Const(0xffffn); c.op(OP.I64_AND);
+            if (i > 0) { c.i64Const(BigInt(i * 16)); c.op(OP.I64_SHL); }
+            c.op(OP.I64_OR);
+          }
+          c.localSet(half);
+        }
+        c.i32Const(OFF_Q(vd)); c.localGet(0); c.storeI64(0, 3);
+        c.i32Const(OFF_Q(vd) + 8); c.localGet(1); c.storeI64(0, 3);
+      }
       pc = nextPC;
       continue;
     }

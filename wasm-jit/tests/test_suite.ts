@@ -1220,6 +1220,55 @@ async function testUnifiedSimdLoadStore() {
   console.log(`[PASS] Test 26 (Unified FP/SIMD B/H/S/D/Q Load/Store): 0x3d0042c0 (STR B0)=2 verified`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 27: Real-Device BusyBox/musl INS V0.S[1], W1 (0x4e0c1c20) + DUP element
+// ---------------------------------------------------------------------------
+async function testInsAndDupElement() {
+  const code = [
+    0x4f00e400, // MOVI V0.16B, #0
+    A64.movz(1, 0x1234),
+    0x4e0c1c20, // exact iPhone opcode at PC=0x451c60: INS V0.S[1], W1
+    0x4e083c02, // UMOV X2, V0.D[0] -> expect 0x00001234_00000000
+    A64.movReg(19, 2),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 0x0000123400000000n, 'INS V0.S[1], W1 (0x4e0c1c20) failed');
+  console.log(`[PASS] Test 27 (INS V0.S[1], W1): 0x4e0c1c20 verified`);
+}
+
+
+// ---------------------------------------------------------------------------
+// Test 28: Real-Device BusyBox/musl SXTL V0.2D, V0.2S (0x0f20a400) + UXTL
+// ---------------------------------------------------------------------------
+async function testSxtlUxtl() {
+  const code = [
+    // Pack w0 = -5 (0xFFFFFFFB) into V0.S[0] and w1 = 42 into V0.S[1]
+    A64.movn(0, 4),  // -5
+    0x4e041c00,      // INS V0.S[0], W0
+    A64.movz(1, 42),
+    0x4e0c1c20,      // INS V0.S[1], W1
+    // Exact iPhone opcode at PC=0x451c64: 0x0f20a400 = SXTL V0.2D, V0.2S
+    0x0f20a400,
+    0x4e083c13,      // UMOV X19, V0.D[0] -> expect -5n
+    0x4e183c14,      // UMOV X20, V0.D[1] -> expect 42n
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(BigInt.asIntN(64, proc.cpu.getReg(19)), -5n, 'SXTL lane 0');
+  assert.strictEqual(proc.cpu.getReg(20), 42n, 'SXTL lane 1');
+  console.log(`[PASS] Test 28 (SXTL/SSHLL V0.2D, V0.2S): 0x0f20a400 (-5, 42) verified`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -1247,7 +1296,9 @@ async function testUnifiedSimdLoadStore() {
   await testSimdStrQNotHijackedByGP();
   await testAuditHardening();
   await testUnifiedSimdLoadStore();
-  console.log('\nALL 26 TESTS PASSED.');
+  await testInsAndDupElement();
+  await testSxtlUxtl();
+  console.log('\nALL 28 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);
