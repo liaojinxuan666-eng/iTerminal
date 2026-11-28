@@ -19,6 +19,8 @@
     IOCTL: 29,
     MKDIRAT: 34,
     UNLINKAT: 35,
+    SYMLINKAT: 36,
+    FACCESSAT: 48,
     CHDIR: 49,
     OPENAT: 56,
     CLOSE: 57,
@@ -29,13 +31,24 @@
     WRITE: 64,
     READV: 65,
     WRITEV: 66,
+    PPOLL: 73,
+    READLINKAT: 78,
     NEWFSTATAT: 79,
     FSTAT: 80,
     EXIT: 93,
     EXIT_GROUP: 94,
     SET_TID_ADDRESS: 96,
+    FUTEX: 98,
     CLOCK_GETTIME: 113,
+    KILL: 129,
+    TKILL: 130,
+    TGKILL: 131,
+    RT_SIGACTION: 134,
+    RT_SIGPROCMASK: 135,
+    SETPGID: 154,
+    GETPGID: 155,
     UNAME: 160,
+    UMASK: 166,
     GETPID: 172,
     GETPPID: 173,
     GETUID: 174,
@@ -49,11 +62,38 @@
     MMAP: 222,
     MPROTECT: 226,
     WAIT4: 260,
+    PRLIMIT64: 261,
+    RENAMEAT2: 276,
+    GETRANDOM: 278,
+  };
+
+  const SIG = {
+    SIGHUP: 1,
+    SIGINT: 2,
+    SIGQUIT: 3,
+    SIGKILL: 9,
+    SIGPIPE: 13,
+    SIGTERM: 15,
+    SIGCHLD: 17,
+    SIGWINCH: 28,
+  };
+
+  const IOCTL_CMD = {
+    TCGETS: 0x5401,
+    TCSETS: 0x5402,
+    TCSETSW: 0x5403,
+    TCSETSF: 0x5404,
+    TIOCGPGRP: 0x540f,
+    TIOCSPGRP: 0x5410,
+    TIOCGWINSZ: 0x5413,
+    TIOCSWINSZ: 0x5414,
   };
 
   const ERRNO = {
     EPERM: 1,
     ENOENT: 2,
+    ESRCH: 3,
+    EINTR: 4,
     EBADF: 9,
     ECHILD: 10,
     EAGAIN: 11,
@@ -89,9 +129,7 @@
       const aligned = alignUp(newBrk, PAGE_SIZE);
       if (aligned >= this.mmapBase) return this.brkCurrent;
       cpu.ensureMemory(aligned);
-      if (aligned > this.brkCurrent) {
-        cpu.u8.fill(0, this.brkCurrent, aligned);
-      }
+      if (aligned > this.brkCurrent) cpu.u8.fill(0, this.brkCurrent, aligned);
       this.brkCurrent = newBrk;
       return this.brkCurrent;
     }
@@ -143,14 +181,9 @@
     }
 
     tryRead(maxLen) {
-      if (this.chunks.length === 0) {
-        return this.writers === 0 ? new Uint8Array(0) : null;
-      }
+      if (this.chunks.length === 0) return this.writers === 0 ? new Uint8Array(0) : null;
       const first = this.chunks[0];
-      if (first.length <= maxLen) {
-        this.chunks.shift();
-        return first;
-      }
+      if (first.length <= maxLen) { this.chunks.shift(); return first; }
       const slice = first.subarray(0, maxLen);
       this.chunks[0] = first.subarray(maxLen);
       return slice;
@@ -176,15 +209,11 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Build Linux AArch64 initial stack: [argc, argv..., 0, envp..., 0, auxv..., 0, 0]
-  // ---------------------------------------------------------------------------
   function setupInitialStack(cpu, stackTop, argv = ['/bin/app'], envp = ['PATH=/bin:/usr/bin']) {
     const enc = new TextEncoder();
     let sp = stackTop >>> 0;
     cpu.ensureMemory(sp + 0x1000);
 
-    // 16 random bytes for AT_RANDOM
     sp -= 16;
     const randomPtr = sp;
     for (let i = 0; i < 16; i++) cpu.u8[randomPtr + i] = (i * 37 + 13) & 0xff;
@@ -198,40 +227,29 @@
 
     const envPtrs = envp.map(writeCString);
     const argPtrs = argv.map(writeCString);
-
-    // Align down to 16 bytes
     sp &= ~0xf;
 
     const auxv = [
-      [6, PAGE_SIZE],   // AT_PAGESZ
-      [11, 0],          // AT_UID
-      [12, 0],          // AT_EUID
-      [13, 0],          // AT_GID
-      [14, 0],          // AT_EGID
-      [25, randomPtr],  // AT_RANDOM
-      [0, 0],           // AT_NULL
+      [6, PAGE_SIZE],
+      [11, 0], [12, 0], [13, 0], [14, 0],
+      [25, randomPtr],
+      [0, 0],
     ];
 
     const totalQwords = 1 + argPtrs.length + 1 + envPtrs.length + 1 + auxv.length * 2;
     sp -= totalQwords * 8;
-    sp &= ~0xf; // AArch64 ABI requires 16-byte aligned SP at _start
+    sp &= ~0xf;
 
     const dv = cpu.view;
     let cur = sp;
-    const push64 = (v) => {
-      dv.setBigUint64(cur, BigInt(v >>> 0), true);
-      cur += 8;
-    };
+    const push64 = (v) => { dv.setBigUint64(cur, BigInt(v >>> 0), true); cur += 8; };
 
-    push64(argPtrs.length); // argc
+    push64(argPtrs.length);
     for (const p of argPtrs) push64(p);
     push64(0);
     for (const p of envPtrs) push64(p);
     push64(0);
-    for (const [k, v] of auxv) {
-      push64(k);
-      push64(v);
-    }
+    for (const [k, v] of auxv) { push64(k); push64(v); }
 
     cpu.setReg(31, sp);
     return sp;
@@ -260,6 +278,11 @@
     constructor(engine, hostAdapter = {}) {
       this.engine = engine;
       this.fs = hostAdapter.fs || new MemFS();
+      this.tty = {
+        rows: hostAdapter.rows || 24,
+        cols: hostAdapter.cols || 80,
+        fgPgrp: 1,
+      };
       this.host = {
         onStdout: hostAdapter.onStdout || (() => {}),
         onStderr: hostAdapter.onStderr || (() => {}),
@@ -271,19 +294,41 @@
       this.waiters = [];
     }
 
+    resizeTerminal(rows, cols) {
+      this.tty.rows = rows;
+      this.tty.cols = cols;
+      for (const proc of this.processes.values()) {
+        if (proc.state !== 'exited') this.sendSignal(proc.pid, SIG.SIGWINCH);
+      }
+    }
+
+    sendSignal(pid, sig) {
+      const proc = this.processes.get(pid);
+      if (!proc || proc.state === 'exited') return false;
+      proc.pendingSignals.push(sig);
+      return true;
+    }
+
     spawnELF(elfBytes, opts = {}) {
       const pid = this.nextPid++;
+      const argv = opts.argv || ['/bin/app'];
       const proc = {
         pid,
         ppid: 0,
+        pgid: pid,
+        exePath: opts.exePath || argv[0] || '/bin/app',
         cwd: opts.cwd || '/',
+        umask: 0o022,
         state: 'runnable',
         exitCode: 0,
+        termSignal: 0,
         pendingPromise: null,
+        sigHandlers: new Map(), // sig -> handlerAddr (0=SIG_DFL, 1=SIG_IGN)
+        pendingSignals: [],
         fds: new Map([
-          [0, { kind: 'stdin' }],
-          [1, { kind: 'stdout' }],
-          [2, { kind: 'stderr' }],
+          [0, { kind: 'stdin', isTty: true }],
+          [1, { kind: 'stdout', isTty: true }],
+          [2, { kind: 'stderr', isTty: true }],
         ]),
         nextFd: 3,
         vmm: null,
@@ -292,12 +337,30 @@
 
       const cpu = new WasmDBT.GuestCPU(this.engine, () => this._handleSyscall(proc), 64, 4096);
       const { brkStart } = WasmDBT.loadELF64(cpu, elfBytes);
-      setupInitialStack(cpu, 0x001ff000, opts.argv || ['/bin/app'], opts.envp || ['PATH=/bin']);
+      setupInitialStack(cpu, 0x001ff000, argv, opts.envp || ['PATH=/bin:/usr/bin', 'TERM=xterm-256color']);
 
       proc.cpu = cpu;
       proc.vmm = new CompactVMM(brkStart, 0x00200000);
       this.processes.set(pid, proc);
       return proc;
+    }
+
+    _deliverPendingSignals(proc) {
+      while (proc.pendingSignals.length > 0) {
+        const sig = proc.pendingSignals.shift();
+        const handler = proc.sigHandlers.get(sig) || 0n;
+        if (handler === 1n) continue; // SIG_IGN
+        if (sig === SIG.SIGWINCH || sig === SIG.SIGCHLD) continue; // default ignore
+        if (handler === 0n) {
+          // Default fatal signal (SIGINT, SIGTERM, SIGKILL, etc.)
+          proc.termSignal = sig;
+          proc.exitCode = 128 + sig;
+          proc.state = 'exited';
+          this._onProcessExit(proc);
+          return true;
+        }
+      }
+      return false;
     }
 
     async runAll(opts = {}) {
@@ -310,6 +373,7 @@
 
         for (const proc of this.processes.values()) {
           if (proc.state === 'exited') continue;
+          if (this._deliverPendingSignals(proc)) continue;
           if (proc.state === 'blocked') {
             if (proc.pendingPromise) blockedPromises.push(proc.pendingPromise);
             continue;
@@ -356,7 +420,7 @@
       proc.pendingPromise = promise.then((retVal) => {
         proc.cpu.setReg(0, BigInt.asUintN(64, BigInt(retVal)));
         proc.pendingPromise = null;
-        proc.state = 'runnable';
+        if (proc.state !== 'exited') proc.state = 'runnable';
       });
       return STATUS.SYSCALL_PENDING;
     }
@@ -399,19 +463,96 @@
 
         case SYS.GETPID: return ret(proc.pid);
         case SYS.GETPPID: return ret(proc.ppid);
+        case SYS.GETPGID: return ret(proc.pgid);
+        case SYS.SETPGID: proc.pgid = a1 || proc.pid; return ret(0);
         case SYS.GETUID:
         case SYS.GETEUID:
         case SYS.GETGID:
         case SYS.GETEGID:
           return ret(0);
 
-        case SYS.SET_TID_ADDRESS:
-          return ret(proc.pid);
+        case SYS.UMASK: {
+          const old = proc.umask;
+          proc.umask = a0 & 0o777;
+          return ret(old);
+        }
 
+        case SYS.SET_TID_ADDRESS: return ret(proc.pid);
+        case SYS.FUTEX: return ret(0);
         case SYS.BRK: return ret(proc.vmm.brk(cpu, a0));
         case SYS.MMAP: return ret(proc.vmm.mmap(cpu, a0, a1, a2, a3));
         case SYS.MUNMAP: return ret(proc.vmm.munmap(a0, a1));
         case SYS.MPROTECT: return ret(0);
+
+        case SYS.GETRANDOM: {
+          for (let i = 0; i < a1; i++) {
+            cpu.u8[a0 + i] = Math.floor(Math.random() * 256);
+          }
+          return ret(a1);
+        }
+
+        case SYS.PRLIMIT64: {
+          if (a3) {
+            cpu.view.setBigUint64(a3, 0x10000000n, true);
+            cpu.view.setBigUint64(a3 + 8, 0x10000000n, true);
+          }
+          return ret(0);
+        }
+
+        case SYS.RT_SIGACTION: {
+          const sig = a0;
+          if (a2) {
+            const oldH = proc.sigHandlers.get(sig) || 0n;
+            cpu.view.setBigUint64(a2, oldH, true);
+          }
+          if (a1) {
+            const newH = cpu.view.getBigUint64(a1, true);
+            proc.sigHandlers.set(sig, newH);
+          }
+          return ret(0);
+        }
+
+        case SYS.RT_SIGPROCMASK:
+          return ret(0);
+
+        case SYS.KILL:
+        case SYS.TKILL:
+        case SYS.TGKILL: {
+          const targetPid = nr === SYS.TGKILL ? a1 : a0;
+          const sig = nr === SYS.TGKILL ? a2 : a1;
+          return ret(this.sendSignal(targetPid, sig) ? 0 : -ERRNO.ESRCH);
+        }
+
+        case SYS.IOCTL: {
+          const fdObj = proc.fds.get(a0);
+          if (!fdObj || !fdObj.isTty) return ret(-ERRNO.ENOTTY);
+          const cmd = a1 >>> 0;
+          if (cmd === IOCTL_CMD.TIOCGWINSZ) {
+            cpu.view.setUint16(a2 + 0, this.tty.rows, true);
+            cpu.view.setUint16(a2 + 2, this.tty.cols, true);
+            cpu.view.setUint16(a2 + 4, 0, true);
+            cpu.view.setUint16(a2 + 6, 0, true);
+            return ret(0);
+          }
+          if (cmd === IOCTL_CMD.TIOCSWINSZ) {
+            this.tty.rows = cpu.view.getUint16(a2 + 0, true);
+            this.tty.cols = cpu.view.getUint16(a2 + 2, true);
+            return ret(0);
+          }
+          if (cmd === IOCTL_CMD.TIOCGPGRP) {
+            cpu.view.setInt32(a2, this.tty.fgPgrp, true);
+            return ret(0);
+          }
+          if (cmd === IOCTL_CMD.TIOCSPGRP) {
+            this.tty.fgPgrp = cpu.view.getInt32(a2, true);
+            return ret(0);
+          }
+          if (cmd === IOCTL_CMD.TCGETS || cmd === IOCTL_CMD.TCSETS || cmd === IOCTL_CMD.TCSETSW || cmd === IOCTL_CMD.TCSETSF) {
+            if (cmd === IOCTL_CMD.TCGETS) cpu.u8.fill(0, a2, a2 + 60);
+            return ret(0);
+          }
+          return ret(-ERRNO.ENOTTY);
+        }
 
         case SYS.GETCWD: {
           const bytes = new TextEncoder().encode(proc.cwd + '\0');
@@ -429,6 +570,50 @@
           return ret(0);
         }
 
+        case SYS.MKDIRAT: {
+          const full = this._resolvePathAt(proc, a0, readCString(cpu.u8, a1));
+          this.fs.mkdirp(full);
+          return ret(0);
+        }
+
+        case SYS.UNLINKAT: {
+          const full = this._resolvePathAt(proc, a0, readCString(cpu.u8, a1));
+          return ret(this.fs.unlink(full) ? 0 : -ERRNO.ENOENT);
+        }
+
+        case SYS.SYMLINKAT: {
+          const target = readCString(cpu.u8, a0);
+          const linkPath = this._resolvePathAt(proc, a1, readCString(cpu.u8, a2));
+          this.fs.symlink(target, linkPath);
+          return ret(0);
+        }
+
+        case SYS.RENAMEAT2: {
+          const oldP = this._resolvePathAt(proc, a0, readCString(cpu.u8, a1));
+          const newP = this._resolvePathAt(proc, a2, readCString(cpu.u8, a3));
+          return ret(this.fs.rename(oldP, newP) ? 0 : -ERRNO.ENOENT);
+        }
+
+        case SYS.FACCESSAT: {
+          const full = this._resolvePathAt(proc, a0, readCString(cpu.u8, a1));
+          return ret(this.fs.stat(full) ? 0 : -ERRNO.ENOENT);
+        }
+
+        case SYS.READLINKAT: {
+          const full = this._resolvePathAt(proc, a0, readCString(cpu.u8, a1));
+          let target = null;
+          if (full === '/proc/self/exe' || full === `/proc/${proc.pid}/exe`) {
+            target = proc.exePath;
+          } else {
+            target = this.fs.readlink(full);
+          }
+          if (!target) return ret(-ERRNO.ENOENT);
+          const bytes = new TextEncoder().encode(target);
+          const n = Math.min(a3, bytes.length);
+          cpu.u8.set(bytes.subarray(0, n), a2);
+          return ret(n);
+        }
+
         case SYS.OPENAT: {
           const rel = readCString(cpu.u8, a1);
           const full = this._resolvePathAt(proc, a0, rel);
@@ -443,7 +628,7 @@
           const fd = proc.nextFd++;
           proc.fds.set(fd, {
             kind: st.isDir ? 'dir' : 'file',
-            path: full,
+            path: this.fs.resolveSymlinks(full),
             offset: 0,
             dirEntries: st.isDir ? this.fs.listDir(full) : null,
             dirIdx: 0,
@@ -467,7 +652,8 @@
         case SYS.NEWFSTATAT: {
           const rel = readCString(cpu.u8, a1);
           const full = this._resolvePathAt(proc, a0, rel);
-          const st = this.fs.stat(full);
+          const AT_SYMLINK_NOFOLLOW = 0x100;
+          const st = this.fs.stat(full, '/', (a3 & AT_SYMLINK_NOFOLLOW) === 0);
           if (!st) return ret(-ERRNO.ENOENT);
           MemFS.writeAArch64Stat(cpu.view, a2, st);
           return ret(0);
@@ -521,19 +707,13 @@
           return ret(a1);
         }
 
-        case SYS.FCNTL:
-          return ret(0);
-
-        case SYS.IOCTL:
-          return ret(-ERRNO.ENOTTY);
+        case SYS.FCNTL: return ret(0);
 
         case SYS.UNAME: {
           const fields = ['Linux', 'iterminal', '6.1.0-wasm-jit', '#1 SMP', 'aarch64', 'local'];
           const enc = new TextEncoder();
           cpu.u8.fill(0, a0, a0 + 65 * 6);
-          for (let i = 0; i < fields.length; i++) {
-            cpu.u8.set(enc.encode(fields[i]), a0 + i * 65);
-          }
+          for (let i = 0; i < fields.length; i++) cpu.u8.set(enc.encode(fields[i]), a0 + i * 65);
           return ret(0);
         }
 
@@ -598,10 +778,7 @@
           }
           if (fdObj.kind === 'pipe_r') {
             const chunk = fdObj.pipe.tryRead(a2);
-            if (chunk !== null) {
-              cpu.u8.set(chunk, a1);
-              return ret(chunk.length);
-            }
+            if (chunk !== null) { cpu.u8.set(chunk, a1); return ret(chunk.length); }
             return this._suspend(
               proc,
               fdObj.pipe.waitReadable().then(() => {
@@ -639,10 +816,16 @@
           const childProc = {
             pid: childPid,
             ppid: proc.pid,
+            pgid: proc.pgid,
+            exePath: proc.exePath,
             cwd: proc.cwd,
+            umask: proc.umask,
             state: 'runnable',
             exitCode: 0,
+            termSignal: 0,
             pendingPromise: null,
+            sigHandlers: new Map(proc.sigHandlers),
+            pendingSignals: [],
             fds: childFds,
             nextFd: proc.nextFd,
             vmm: proc.vmm.clone(),
@@ -656,12 +839,14 @@
 
         case SYS.EXECVE: {
           const path = normalizePath(readCString(cpu.u8, a0), proc.cwd);
-          const elfBytes = this.fs.readFile(path);
+          const resolved = this.fs.resolveSymlinks(path);
+          const elfBytes = this.fs.readFile(resolved);
           if (!elfBytes) return ret(-ERRNO.ENOENT);
           const argv = readCStringArray(cpu, a1);
           const envp = readCStringArray(cpu, a2);
 
-          // Replace process image in-place while preserving PID & open FDs (pipes/stdout!)
+          proc.exePath = resolved;
+          proc.sigHandlers.clear();
           cpu.resetForExec();
           const { brkStart } = WasmDBT.loadELF64(cpu, elfBytes);
           setupInitialStack(cpu, 0x001ff000, argv.length ? argv : [path], envp);
@@ -677,7 +862,10 @@
               const p = this.processes.get(pid);
               if (p && p.ppid === proc.pid && (targetPid === -1 || targetPid === pid)) {
                 this.exited.delete(pid);
-                if (statusPtr) cpu.view.setInt32(statusPtr, (code & 0xff) << 8, true);
+                if (statusPtr) {
+                  const wstatus = p.termSignal ? (p.termSignal & 0x7f) : ((code & 0xff) << 8);
+                  cpu.view.setInt32(statusPtr, wstatus, true);
+                }
                 return pid;
               }
             }
@@ -701,10 +889,8 @@
 
         case SYS.CLOCK_GETTIME: {
           const nowMs = Date.now();
-          const sec = BigInt(Math.floor(nowMs / 1000));
-          const nsec = BigInt((nowMs % 1000) * 1000000);
-          cpu.view.setBigInt64(a1, sec, true);
-          cpu.view.setBigInt64(a1 + 8, nsec, true);
+          cpu.view.setBigInt64(a1, BigInt(Math.floor(nowMs / 1000)), true);
+          cpu.view.setBigInt64(a1 + 8, BigInt((nowMs % 1000) * 1000000), true);
           return ret(0);
         }
 
@@ -718,5 +904,5 @@
     return (n + align - 1) & ~(align - 1);
   }
 
-  return { SYS, ERRNO, CompactVMM, PipeBuffer, GuestKernel, setupInitialStack };
+  return { SYS, SIG, IOCTL_CMD, ERRNO, CompactVMM, PipeBuffer, GuestKernel, setupInitialStack };
 });

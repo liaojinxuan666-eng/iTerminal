@@ -18,6 +18,7 @@
   const OFF_C = STATE_BASE + 0x110;
   const OFF_V = STATE_BASE + 0x114;
   const OFF_TPIDR = STATE_BASE + 0x118;
+  const OFF_Q = (n) => STATE_BASE + 0x120 + n * 16; // Q0..Q31 (128-bit SIMD)
 
   const ICACHE_BASE = 0x1000;
   const ICACHE_ENTRIES = 4096;
@@ -904,6 +905,228 @@
         continue;
       }
 
+
+      // 25. LDR (literal) 32-bit / 64-bit / LDRSW (PC-relative constant pool)
+      if (((insn & 0x3b000000) >>> 0) === 0x18000000) {
+        const opc = (insn >>> 30) & 0x3; // 0=32u, 1=64, 2=32s
+        const imm19 = signExtend((insn >>> 5) & 0x7ffff, 19);
+        const rt = insn & 0x1f;
+        const addr = (pc + (imm19 << 2)) >>> 0;
+        if (c.beginSetReg(rt, false)) {
+          c.i32Const(addr);
+          if (opc === 0) c.op(OP.I64_LOAD32_U, 2, 0);
+          else if (opc === 1) c.loadI64(0, 3);
+          else c.op(OP.I64_LOAD32_S, 2, 0);
+          c.endSetReg(rt, false, opc === 0);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 26. UMULH (0x9BC07C00) — GCC uses this for constant division (printf/itoa)
+      if (((insn & 0xffe0fc00) >>> 0) === 0x9bc07c00) {
+        const rm = (insn >>> 16) & 0x1f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        if (c.beginSetReg(rd, false)) {
+          // local 0 = a, local 1 = b, local 2 = p01, local 4 = p10, local 5 = mid
+          c.getReg(rn, false, false); c.localSet(0);
+          c.getReg(rm, false, false); c.localSet(1);
+
+          // p01 = (a & 0xffffffff) * (b >>> 32)
+          c.localGet(0); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+          c.localGet(1); c.i64Const(32n); c.op(OP.I64_SHR_U);
+          c.op(OP.I64_MUL); c.localSet(2);
+
+          // p10 = (a >>> 32) * (b & 0xffffffff)
+          c.localGet(0); c.i64Const(32n); c.op(OP.I64_SHR_U);
+          c.localGet(1); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+          c.op(OP.I64_MUL); c.localSet(4);
+
+          // mid = (((a & 0xffffffff) * (b & 0xffffffff)) >>> 32) + (p01 & 0xffffffff) + (p10 & 0xffffffff)
+          c.localGet(0); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+          c.localGet(1); c.i64Const(0xffffffffn); c.op(OP.I64_AND);
+          c.op(OP.I64_MUL); c.i64Const(32n); c.op(OP.I64_SHR_U);
+          c.localGet(2); c.i64Const(0xffffffffn); c.op(OP.I64_AND); c.op(OP.I64_ADD);
+          c.localGet(4); c.i64Const(0xffffffffn); c.op(OP.I64_AND); c.op(OP.I64_ADD);
+          c.localSet(5);
+
+          // hi = (a >>> 32)*(b >>> 32) + (p01 >>> 32) + (p10 >>> 32) + (mid >>> 32)
+          c.localGet(0); c.i64Const(32n); c.op(OP.I64_SHR_U);
+          c.localGet(1); c.i64Const(32n); c.op(OP.I64_SHR_U);
+          c.op(OP.I64_MUL);
+          c.localGet(2); c.i64Const(32n); c.op(OP.I64_SHR_U); c.op(OP.I64_ADD);
+          c.localGet(4); c.i64Const(32n); c.op(OP.I64_SHR_U); c.op(OP.I64_ADD);
+          c.localGet(5); c.i64Const(32n); c.op(OP.I64_SHR_U); c.op(OP.I64_ADD);
+          c.endSetReg(rd, false, false);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 27. Data-processing (1-source): CLZ (4), REV16 (1), REV32 (2), REV64 (3)
+      if (((insn & 0x5fe00000) >>> 0) === 0x5ac00000) {
+        const is64 = (insn >>> 31) === 1;
+        const opcode = (insn >>> 10) & 0x3f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        if (c.beginSetReg(rd, false)) {
+          if (opcode === 4) {
+            // CLZ
+            c.getReg(rn, false, !is64);
+            if (is64) {
+              c.op(OP.I64_CLZ);
+            } else {
+              c.op(OP.I32_WRAP_I64, OP.I32_CLZ, OP.I64_EXTEND_I32_U);
+            }
+          } else if (opcode === 3 || (opcode === 2 && !is64)) {
+            // REV64 / REV32 (byte swap)
+            c.getReg(rn, false, !is64);
+            c.localSet(0);
+            const nBytes = is64 ? 8 : 4;
+            c.i64Const(0n);
+            for (let b = 0; b < nBytes; b++) {
+              c.localGet(0);
+              if (b > 0) { c.i64Const(BigInt(b * 8)); c.op(OP.I64_SHR_U); }
+              c.i64Const(0xffn); c.op(OP.I64_AND);
+              const dstShift = (nBytes - 1 - b) * 8;
+              if (dstShift > 0) { c.i64Const(BigInt(dstShift)); c.op(OP.I64_SHL); }
+              c.op(OP.I64_OR);
+            }
+          } else {
+            c.getReg(rn, false, !is64);
+          }
+          c.endSetReg(rd, false, !is64);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 28. CCMP / CCMN (register & immediate)
+      if (((insn & 0x1fe00410) >>> 0) === 0x1a400000) {
+        const is64 = (insn >>> 31) === 1;
+        const isSub = ((insn >>> 30) & 1) === 1; // 1=CCMP (SUB), 0=CCMN (ADD)
+        const isImm = ((insn >>> 11) & 1) === 1;
+        const rmOrImm5 = (insn >>> 16) & 0x1f;
+        const cond = (insn >>> 12) & 0xf;
+        const rn = (insn >>> 5) & 0x1f;
+        const nzcv = insn & 0xf;
+
+        c.emitCond(cond);
+        c.op(OP.IF, VALTYPE.VOID);
+        c.getReg(rn, false, !is64); c.localSet(0);
+        if (isImm) c.i64Const(BigInt(rmOrImm5));
+        else c.getReg(rmOrImm5, false, !is64);
+        c.localSet(1);
+        emitAddSub(c, is64, isSub, true, 31, false);
+        c.op(OP.ELSE);
+        c.i32Const(OFF_N); c.i32Const((nzcv >>> 3) & 1); c.storeI32(0, 2);
+        c.i32Const(OFF_Z); c.i32Const((nzcv >>> 2) & 1); c.storeI32(0, 2);
+        c.i32Const(OFF_C); c.i32Const((nzcv >>> 1) & 1); c.storeI32(0, 2);
+        c.i32Const(OFF_V); c.i32Const(nzcv & 1); c.storeI32(0, 2);
+        c.op(OP.END);
+        pc = nextPC;
+        continue;
+      }
+
+      // 29. EXTR (extract register / ROR immediate)
+      if (((insn & 0x1f800000) >>> 0) === 0x13800000) {
+        const is64 = (insn >>> 31) === 1;
+        const rm = (insn >>> 16) & 0x1f;
+        const imms = (insn >>> 10) & 0x3f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        const bits = is64 ? 64 : 32;
+        if (c.beginSetReg(rd, false)) {
+          if (imms === 0) {
+            c.getReg(rm, false, !is64);
+          } else {
+            c.getReg(rm, false, !is64);
+            c.i64Const(BigInt(imms));
+            c.op(OP.I64_SHR_U);
+            c.getReg(rn, false, !is64);
+            c.i64Const(BigInt(bits - imms));
+            c.op(OP.I64_SHL);
+            c.op(OP.I64_OR);
+          }
+          c.endSetReg(rd, false, !is64);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 30. 128-bit SIMD LDP/STP Q-registers (used by musl memcpy/memset!)
+      // opc=2 (10), V=1 (bit 26): (insn & 0xFE400000) === 0xAC000000 (STP Q) / 0xAC400000 (LDP Q)
+      if (
+        ((insn & 0xfe400000) >>> 0) === 0xac000000 ||
+        ((insn & 0xfe400000) >>> 0) === 0xac400000 ||
+        ((insn & 0xfe400000) >>> 0) === 0xad000000 ||
+        ((insn & 0xfe400000) >>> 0) === 0xad400000 ||
+        ((insn & 0xfe400000) >>> 0) === 0xad800000 ||
+        ((insn & 0xfe400000) >>> 0) === 0xadc00000
+      ) {
+        const mode = (insn >>> 23) & 0x3; // 1=post, 2=signed-off, 3=pre
+        const isLoad = ((insn >>> 22) & 1) === 1;
+        const imm7 = signExtend((insn >>> 15) & 0x7f, 7);
+        const qt2 = (insn >>> 10) & 0x1f;
+        const rn = (insn >>> 5) & 0x1f;
+        const qt = insn & 0x1f;
+        const offset = imm7 * 16;
+
+        c.getReg(rn, true, false);
+        if (mode === 2 || mode === 3) {
+          c.i64Const(BigInt(offset));
+          c.op(OP.I64_ADD);
+        }
+        c.op(OP.I32_WRAP_I64);
+        c.localSet(3);
+
+        if (isLoad) {
+          // Load qt (lo, hi) and qt2 (lo, hi)
+          c.i32Const(OFF_Q(qt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.i32Const(OFF_Q(qt) + 8); c.localGet(3); c.loadI64(8, 3); c.storeI64(0, 3);
+          c.i32Const(OFF_Q(qt2)); c.localGet(3); c.loadI64(16, 3); c.storeI64(0, 3);
+          c.i32Const(OFF_Q(qt2) + 8); c.localGet(3); c.loadI64(24, 3); c.storeI64(0, 3);
+        } else {
+          c.localGet(3); c.i32Const(OFF_Q(qt)); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.localGet(3); c.i32Const(OFF_Q(qt) + 8); c.loadI64(0, 3); c.storeI64(8, 3);
+          c.localGet(3); c.i32Const(OFF_Q(qt2)); c.loadI64(0, 3); c.storeI64(16, 3);
+          c.localGet(3); c.i32Const(OFF_Q(qt2) + 8); c.loadI64(0, 3); c.storeI64(24, 3);
+        }
+
+        if (mode === 1 || mode === 3) {
+          if (c.beginSetReg(rn, true)) {
+            c.getReg(rn, true, false);
+            c.i64Const(BigInt(offset));
+            c.op(OP.I64_ADD);
+            c.endSetReg(rn, true, false);
+          }
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 31. 128-bit SIMD LDR/STR Qt, [Xn, #uimm12*16] (unsigned offset)
+      if (((insn & 0xff800000) >>> 0) === 0x3d800000 || ((insn & 0xff800000) >>> 0) === 0x3dc00000) {
+        const isLoad = ((insn >>> 22) & 1) === 1;
+        const imm12 = (insn >>> 10) & 0xfff;
+        const rn = (insn >>> 5) & 0x1f;
+        const qt = insn & 0x1f;
+        c.getReg(rn, true, false);
+        if (imm12 > 0) { c.i64Const(BigInt(imm12 * 16)); c.op(OP.I64_ADD); }
+        c.op(OP.I32_WRAP_I64);
+        c.localSet(3);
+        if (isLoad) {
+          c.i32Const(OFF_Q(qt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.i32Const(OFF_Q(qt) + 8); c.localGet(3); c.loadI64(8, 3); c.storeI64(0, 3);
+        } else {
+          c.localGet(3); c.i32Const(OFF_Q(qt)); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.localGet(3); c.i32Const(OFF_Q(qt) + 8); c.loadI64(0, 3); c.storeI64(8, 3);
+        }
+        pc = nextPC;
+        continue;
+      }
+
       // Unrecognized instruction -> fault
       c.setPC(pc);
       c.i32Const(STATUS.FAULT);
@@ -918,7 +1141,7 @@
       c.op(OP.RETURN);
     }
 
-    mb.addFunction(tBlock, [[3, VALTYPE.I64], [1, VALTYPE.I32]], c.b, 'bb');
+    mb.addFunction(tBlock, [[3, VALTYPE.I64], [1, VALTYPE.I32], [2, VALTYPE.I64]], c.b, 'bb');
     return new WebAssembly.Module(mb.toUint8Array());
   }
 

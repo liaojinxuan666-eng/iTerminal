@@ -106,6 +106,9 @@
     I64_GE_S: 0x59,
     I64_GE_U: 0x5a,
 
+    I32_CLZ: 0x67,
+    I32_CTZ: 0x68,
+    I32_POPCNT: 0x69,
     I32_ADD: 0x6a,
     I32_SUB: 0x6b,
     I32_MUL: 0x6c,
@@ -116,6 +119,9 @@
     I32_SHR_S: 0x75,
     I32_SHR_U: 0x76,
 
+    I64_CLZ: 0x79,
+    I64_CTZ: 0x7a,
+    I64_POPCNT: 0x7b,
     I64_ADD: 0x7c,
     I64_SUB: 0x7d,
     I64_MUL: 0x7e,
@@ -129,6 +135,7 @@
     I64_SHL: 0x86,
     I64_SHR_S: 0x87,
     I64_SHR_U: 0x88,
+    I64_ROTL: 0x89,
     I64_ROTR: 0x8a,
 
     I32_WRAP_I64: 0xa7,

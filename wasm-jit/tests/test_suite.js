@@ -4,13 +4,25 @@ const assert = require('assert');
 const { performance } = require('perf_hooks');
 const WasmDBT = require('../src/dbt-runtime');
 const { MemFS } = require('../src/vfs-memfs');
-const { SYS, GuestKernel } = require('../src/vmm-syscalls');
+const { SYS, SIG, IOCTL_CMD, GuestKernel } = require('../src/vmm-syscalls');
 
 // ---------------------------------------------------------------------------
 // Minimal AArch64 Assembler + ELF64 Builder (for self-contained verification)
 // ---------------------------------------------------------------------------
 const A64 = {
   nop: () => 0xd503201f,
+  umulh: (rd, rn, rm) =>
+    (0x9bc07c00 | ((rm & 31) << 16) | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  clz64: (rd, rn) => (0xdac01000 | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  rev64: (rd, rn) => (0xdac00c00 | ((rn & 31) << 5) | (rd & 31)) >>> 0,
+  ccmpImm: (rn, imm5, nzcv, cond) =>
+    (0xfa400800 | ((imm5 & 31) << 16) | ((cond & 15) << 12) | ((rn & 31) << 5) | (nzcv & 15)) >>> 0,
+  ldrLit64: (rt, relInsns) =>
+    (0x58000000 | ((relInsns & 0x7ffff) << 5) | (rt & 31)) >>> 0,
+  ldpQ: (qt, qt2, rn, imm7 = 0) =>
+    (0xad400000 | ((imm7 & 0x7f) << 15) | ((qt2 & 31) << 10) | ((rn & 31) << 5) | (qt & 31)) >>> 0,
+  stpQ: (qt, qt2, rn, imm7 = 0) =>
+    (0xad000000 | ((imm7 & 0x7f) << 15) | ((qt2 & 31) << 10) | ((rn & 31) << 5) | (qt & 31)) >>> 0,
   svc: (imm16 = 0) => (0xd4000001 | ((imm16 & 0xffff) << 5)) >>> 0,
   movz: (rd, imm16, hw = 0) =>
     (0xd2800000 | ((hw & 3) << 21) | ((imm16 & 0xffff) << 5) | (rd & 31)) >>> 0,
@@ -447,6 +459,168 @@ async function testForkExecvePipeline() {
   );
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 9: Musl printf/strlen/memcpy ISA (UMULH, CLZ, REV, CCMP, LDR literal, 128-bit LDP/STP Q)
+// ---------------------------------------------------------------------------
+async function testMuslPrintfMemcpyISA() {
+  // Data pool holds 64-bit magic multiplier for dividing by 10: 0xCCCCCCCCCCCCCCCD
+  const pool = new Uint8Array(64);
+  const pdv = new DataView(pool.buffer);
+  pdv.setBigUint64(0, 0xcccccccccccccccdn, true); // magic / 10
+  // 32 bytes source buffer at pool+16 for 128-bit LDP/STP Q0, Q1 memcpy test
+  pdv.setBigUint64(16, 0x1122334455667788n, true);
+  pdv.setBigUint64(24, 0x99aabbccddeeff00n, true);
+  pdv.setBigUint64(32, 0xdeadbeefcafebaben, true);
+  pdv.setBigUint64(40, 0x0123456789abcdefn, true);
+
+  const code = [
+    // 0: ldr x1, [pc + literal_pool] (patched below)
+    0,
+    // 1..3: UMULH magic division: 12345 / 10 = (umulh(12345, magic) >> 3) = 1234 -> x19
+    A64.movz(0, 12345),
+    A64.umulh(19, 0, 1),
+    A64.ubfm64(19, 19, 3, 63), // LSR #3
+    // 4..5: CLZ(0x0000_0000_0000_0010) = 59 -> x20
+    A64.movz(2, 0x10),
+    A64.clz64(20, 2),
+    // 6..7: REV64(0x0102) -> 0x0201_0000_0000_0000 -> x21
+    A64.movz(3, 0x0102),
+    A64.rev64(21, 3),
+    // 8..11: CCMP: cmp x19, #1234 (EQ); ccmp x20, #59, #0, EQ -> Z=1 -> csel x22 = 1 else 0
+    A64.subsImm(31, 19, 1234),
+    A64.ccmpImm(20, 59 & 31, 0, 0), // wait 59 > 31, use x20 - 59? Let's test imm5=10 with movz(4, 10)
+    A64.movz(4, 10),
+    A64.ccmpImm(4, 10, 0, 0),
+    A64.movz(5, 1),
+    A64.movz(6, 0),
+    A64.csel(22, 5, 6, 0),
+    // 15..20: 128-bit SIMD memcpy via LDP Q0, Q1, [x7] -> STP Q0, Q1, [sp]
+    A64.subImm(31, 31, 64),
+    A64.movz(7, 0, 0), // patched: src = dataVaddr + 16
+    A64.movk(7, 0, 1),
+    A64.ldpQ(0, 1, 7, 0),
+    A64.stpQ(0, 1, 31, 0),
+    A64.ldr64(23, 31, 0),
+    A64.ldr64(24, 31, 24),
+    A64.movz(0, 0),
+    A64.movz(8, SYS.EXIT_GROUP),
+    A64.svc(0),
+  ];
+  // Clean up index 9 (replace redundant ccmp with nop so cmp x19,#1234 flows cleanly into ccmp x4,#10)
+  code[9] = A64.movz(4, 10);
+  code[10] = A64.subsImm(31, 19, 1234);
+
+  const baseVaddr = 0x10000;
+  const dataOff = (code.length * 4 + 15) & ~15;
+  const dataVaddr = baseVaddr + dataOff;
+  code[0] = A64.ldrLit64(1, dataOff >>> 2);
+  const srcAddr = dataVaddr + 16;
+  code[16] = A64.movz(7, srcAddr & 0xffff, 0);
+  code[17] = A64.movk(7, (srcAddr >>> 16) & 0xffff, 1);
+
+  const { elf } = buildELF64(code, pool, baseVaddr);
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 1234n, 'UMULH /10');
+  assert.strictEqual(proc.cpu.getReg(20), 59n, 'CLZ64');
+  assert.strictEqual(proc.cpu.getReg(21), 0x0201000000000000n, 'REV64');
+  assert.strictEqual(proc.cpu.getReg(22), 1n, 'CCMP+CSEL');
+  assert.strictEqual(proc.cpu.getReg(23), 0x1122334455667788n, 'SIMD LDP/STP Q0');
+  assert.strictEqual(proc.cpu.getReg(24), 0x0123456789abcdefn, 'SIMD LDP/STP Q1');
+  console.log(`[PASS] Test 9 (Musl printf/memcpy ISA): UMULH/CLZ/REV/CCMP/LDR-lit/128-bit Q-reg memcpy verified`);
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: BusyBox Symlinks + /proc/self/exe + TTY ioctl(TIOCGWINSZ)
+// ---------------------------------------------------------------------------
+async function testBusyBoxSymlinkAndTTY() {
+  const enc = new TextEncoder();
+  const sSelf = enc.encode('/proc/self/exe\0');
+  const code = [
+    // readlinkat(AT_FDCWD, "/proc/self/exe", sp - 64, 64) -> write to stdout
+    A64.subImm(31, 31, 96),
+    A64.movn(0, 99),
+    A64.movz(1, 0, 0), // patched: sSelf ptr
+    A64.movk(1, 0, 1),
+    A64.addImm(2, 31, 0),
+    A64.movz(3, 64),
+    A64.movz(8, SYS.READLINKAT),
+    A64.svc(0),
+    A64.movReg(2, 0), A64.movz(0, 1), A64.addImm(1, 31, 0), A64.movz(8, SYS.WRITE), A64.svc(0),
+
+    // ioctl(1, TIOCGWINSZ=0x5413, sp + 64) -> x19 = rows, x20 = cols
+    A64.movz(0, 1),
+    A64.movz(1, IOCTL_CMD.TIOCGWINSZ),
+    A64.addImm(2, 31, 64),
+    A64.movz(8, SYS.IOCTL),
+    A64.svc(0),
+    A64.ldr32(19, 31, 64), // low 16=rows, high 16=cols
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const baseVaddr = 0x10000;
+  const dataOff = (code.length * 4 + 15) & ~15;
+  const sSelfAddr = baseVaddr + dataOff;
+  code[2] = A64.movz(1, sSelfAddr & 0xffff, 0);
+  code[3] = A64.movk(1, (sSelfAddr >>> 16) & 0xffff, 1);
+
+  const { elf } = buildELF64(code, sSelf, baseVaddr);
+  const fs = new MemFS();
+  fs.writeFile('/bin/busybox', elf, 0o755);
+  fs.symlink('/bin/busybox', '/bin/sh');
+
+  let stdout = '';
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
+    fs,
+    rows: 40,
+    cols: 120,
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
+  });
+  const proc = kernel.spawnELF(fs.readFile('/bin/sh'), {
+    argv: ['/bin/sh'],
+    exePath: fs.resolveSymlinks('/bin/sh'),
+  });
+  await kernel.runAll();
+
+  const packed = Number(proc.cpu.getReg(19));
+  const rows = packed & 0xffff;
+  const cols = (packed >>> 16) & 0xffff;
+  assert.strictEqual(stdout, '/bin/busybox');
+  assert.strictEqual(rows, 40);
+  assert.strictEqual(cols, 120);
+  console.log(`[PASS] Test 10 (BusyBox Symlink & TTY ioctl): /proc/self/exe="${stdout}", winsize=${rows}x${cols}`);
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: Interactive Ctrl-C (SIGINT) Signal Interruption
+// ---------------------------------------------------------------------------
+async function testSignalInterrupt() {
+  // Infinite spin loop until interrupted by host SIGINT (exitCode = 128 + 2 = 130)
+  const code = [
+    A64.addImm(0, 0, 1),
+    A64.b(-1),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  // Schedule Ctrl-C (SIGINT) after 10ms while yielding periodically via sliceBudget
+  const runPromise = (async () => {
+    let ticks = 0;
+    while (proc.state !== 'exited') {
+      if (ticks === 5) kernel.sendSignal(proc.pid, SIG.SIGINT);
+      if (kernel._deliverPendingSignals(proc)) break;
+      proc.cpu.stepWasmLoop(1024);
+      ticks++;
+    }
+    return proc.exitCode;
+  })();
+  const codeExit = await runPromise;
+  assert.strictEqual(codeExit, 130, 'SIGINT should terminate with exitCode 130');
+  console.log(`[PASS] Test 11 (Ctrl-C SIGINT Delivery): spin loop cleanly interrupted with exitCode=${codeExit}`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -456,7 +630,10 @@ async function testForkExecvePipeline() {
   await testMuslISA();
   await testVFSAndArgv();
   await testForkExecvePipeline();
-  console.log('\nALL 8 TESTS PASSED.');
+  await testMuslPrintfMemcpyISA();
+  await testBusyBoxSymlinkAndTTY();
+  await testSignalInterrupt();
+  console.log('\nALL 11 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

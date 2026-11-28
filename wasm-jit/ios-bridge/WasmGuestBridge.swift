@@ -26,10 +26,7 @@ public final class ITerminalSchemeHandler: NSObject, WKURLSchemeHandler {
             "Cache-Control": "no-store",
         ]
         if let response = HTTPURLResponse(
-            url: url,
-            statusCode: 200,
-            httpVersion: "HTTP/1.1",
-            headerFields: headers
+            url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers
         ) {
             urlSchemeTask.didReceive(response)
             urlSchemeTask.didReceive(data)
@@ -45,9 +42,7 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
     public weak var delegate: GuestHostDelegate?
     private var isBootstrapped = false
 
-    public override init() {
-        super.init()
-    }
+    public override init() { super.init() }
 
     public func setup(
         encoderJS: String,
@@ -85,30 +80,50 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
         }
     }
 
-    /// Mount an ELF binary or data file into the in-memory VFS (e.g., `/bin/busybox`).
     public func mountFile(path: String, data: Data, mode: Int = 0o755) {
         guard isBootstrapped else { return }
         let b64 = data.base64EncodedString()
-        let escapedPath = path.replacingOccurrences(of: "'", with: "\\'")
-        let js = "window.__iTerminalMountFile('\(escapedPath)', '\(b64)', \(mode));"
-        DispatchQueue.main.async { [weak self] in
-            self?.webView.evaluateJavaScript(js, completionHandler: nil)
-        }
+        let escaped = path.replacingOccurrences(of: "'", with: "\\'")
+        evalJS("window.__iTerminalMountFile('\(escaped)', '\(b64)', \(mode));")
     }
 
-    /// Execute an unmodified AArch64 Linux ELF64 binary with argv/envp on-device via DBT + JSC JIT.
+    /// Register BusyBox applet symlinks (e.g. target: "/bin/busybox", linkPath: "/bin/sh").
+    public func mountSymlink(target: String, linkPath: String) {
+        guard isBootstrapped else { return }
+        let t = target.replacingOccurrences(of: "'", with: "\\'")
+        let l = linkPath.replacingOccurrences(of: "'", with: "\\'")
+        evalJS("window.__iTerminalMountSymlink('\(t)', '\(l)');")
+    }
+
+    /// Sync iOS terminal grid dimensions to guest TTY (updates TIOCGWINSZ & sends SIGWINCH).
+    public func resizeTerminal(rows: Int, cols: Int) {
+        guard isBootstrapped else { return }
+        evalJS("window.__iTerminalResize(\(rows), \(cols));")
+    }
+
+    /// Deliver POSIX signal (default SIGINT=2 for Ctrl-C) to foreground guest process.
+    public func sendInterrupt(signal: Int = 2) {
+        guard isBootstrapped else { return }
+        evalJS("window.__iTerminalSignal(\(signal));")
+    }
+
     public func runELF(
         _ elfData: Data,
-        argv: [String] = ["/bin/app"],
-        envp: [String] = ["PATH=/bin:/usr/bin", "HOME=/root"],
+        argv: [String] = ["/bin/sh"],
+        envp: [String] = ["PATH=/bin:/usr/bin", "HOME=/root", "TERM=xterm-256color"],
+        exePath: String? = nil,
         sliceBudget: Int = 4096
     ) {
         guard isBootstrapped else { return }
         let b64 = elfData.base64EncodedString()
-        let opts: [String: Any] = ["argv": argv, "envp": envp, "sliceBudget": sliceBudget]
+        var opts: [String: Any] = ["argv": argv, "envp": envp, "sliceBudget": sliceBudget]
+        if let exePath = exePath { opts["exePath"] = exePath }
         let optsJSON = (try? JSONSerialization.data(withJSONObject: opts))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        let js = "window.__iTerminalRunELF('\(b64)', \(optsJSON));"
+        evalJS("window.__iTerminalRunELF('\(b64)', \(optsJSON));")
+    }
+
+    private func evalJS(_ js: String) {
         DispatchQueue.main.async { [weak self] in
             self?.webView.evaluateJavaScript(js, completionHandler: nil)
         }
@@ -143,16 +158,12 @@ public final class WasmGuestBridgeV2: NSObject, WKScriptMessageHandler, WKNaviga
     }
 
     private func resolveHostRequest(reqId: Int, result: Result<Data, Error>) {
-        let js: String
         switch result {
         case .success(let data):
-            js = "window.__iTerminalResolveHostReq(\(reqId), '\(data.base64EncodedString())', null);"
+            evalJS("window.__iTerminalResolveHostReq(\(reqId), '\(data.base64EncodedString())', null);")
         case .failure(let err):
             let escaped = err.localizedDescription.replacingOccurrences(of: "'", with: "\\'")
-            js = "window.__iTerminalResolveHostReq(\(reqId), null, '\(escaped)');"
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.webView.evaluateJavaScript(js, completionHandler: nil)
+            evalJS("window.__iTerminalResolveHostReq(\(reqId), null, '\(escaped)');")
         }
     }
 
