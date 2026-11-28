@@ -2,9 +2,11 @@
   'use strict';
 
   /**
-   * WKWebView Guest Runtime v2.2
-   * Supports BusyBox symlinks, live TTY resize (TIOCGWINSZ + SIGWINCH),
-   * Ctrl-C (SIGINT) interruption, and async Swift PTY bridging.
+   * WKWebView Guest Runtime v2.3
+   * - On-device AArch64->WASM DBT + PIE/PT_INTERP dynamic linker loading
+   * - BusyBox symlinks, live TTY resize, Ctrl-C SIGINT
+   * - Async BSD TCP socket bridge to Swift Network.framework (NWConnection)
+   * - MemFS snapshot export/import for iOS Documents sandbox persistence
    */
   class IOSGuestRuntime {
     constructor() {
@@ -33,12 +35,12 @@
       });
     }
 
-    resolveHostRequest(reqId, base64Data, errorMsg) {
+    resolveHostRequest(reqId, value, errorMsg) {
       const entry = this.pendingHostReqs.get(reqId);
       if (!entry) return;
       this.pendingHostReqs.delete(reqId);
       if (errorMsg) { entry.reject(new Error(errorMsg)); return; }
-      entry.resolve(base64ToBytes(base64Data || ''));
+      entry.resolve(value);
     }
 
     mountBase64File(path, base64Data, mode = 0o755) {
@@ -49,6 +51,14 @@
       this.fs.symlink(target, linkPath);
     }
 
+    exportSnapshot() {
+      return this.fs.serialize();
+    }
+
+    importSnapshot(jsonStr) {
+      this.fs = root.WasmMemFS.MemFS.deserialize(jsonStr);
+    }
+
     resizeTerminal(rows, cols) {
       this.ttyRows = rows;
       this.ttyCols = cols;
@@ -56,9 +66,20 @@
     }
 
     sendSignal(sig, pid) {
-      if (this.activeKernel) {
-        this.activeKernel.sendSignal(pid || this.activeRootPid, sig);
-      }
+      if (this.activeKernel) this.activeKernel.sendSignal(pid || this.activeRootPid, sig);
+    }
+
+    _createSwiftNetAdapter() {
+      return {
+        connect: (host, port) => this._requestSwiftAsync('tcp_connect', { host, port }),
+        send: (sockId, bytes) =>
+          this._requestSwiftAsync('tcp_send', { sockId, data: bytesToBase64(bytes) }),
+        recv: (sockId, maxLen) =>
+          this._requestSwiftAsync('tcp_recv', { sockId, maxLen }).then((b64) => base64ToBytes(b64)),
+        close: (sockId) => {
+          this._postToSwift({ type: 'host_req', reqId: 0, op: 'tcp_close', args: { sockId } });
+        },
+      };
     }
 
     async runELFBase64(elfBase64, opts = {}) {
@@ -69,7 +90,9 @@
         cols: this.ttyCols,
         onStdout: (bytes) => this._postToSwift({ type: 'stdout', text: this.decoder.decode(bytes) }),
         onStderr: (bytes) => this._postToSwift({ type: 'stderr', text: this.decoder.decode(bytes) }),
-        readStdinAsync: (maxLen) => this._requestSwiftAsync('read_stdin', { maxLen }),
+        readStdinAsync: (maxLen) =>
+          this._requestSwiftAsync('read_stdin', { maxLen }).then((b64) => base64ToBytes(b64)),
+        net: this._createSwiftNetAdapter(),
       });
 
       this.activeKernel = kernel;
@@ -97,11 +120,19 @@
     return out;
   }
 
+  function bytesToBase64(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
   const runtime = new IOSGuestRuntime();
   root.__iTerminalRuntime = runtime;
-  root.__iTerminalResolveHostReq = (reqId, b64, err) => runtime.resolveHostRequest(reqId, b64, err);
+  root.__iTerminalResolveHostReq = (reqId, val, err) => runtime.resolveHostRequest(reqId, val, err);
   root.__iTerminalMountFile = (path, b64, mode) => runtime.mountBase64File(path, b64, mode);
   root.__iTerminalMountSymlink = (target, linkPath) => runtime.mountSymlink(target, linkPath);
+  root.__iTerminalExportFS = () => runtime.exportSnapshot();
+  root.__iTerminalImportFS = (json) => runtime.importSnapshot(json);
   root.__iTerminalResize = (rows, cols) => runtime.resizeTerminal(rows, cols);
   root.__iTerminalSignal = (sig, pid) => runtime.sendSignal(sig, pid);
   root.__iTerminalRunELF = (elfB64, opts) => runtime.runELFBase64(elfB64, opts);

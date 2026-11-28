@@ -64,6 +64,12 @@
     WAIT4: 260,
     PRLIMIT64: 261,
     RENAMEAT2: 276,
+    SOCKET: 198,
+    CONNECT: 203,
+    SENDTO: 206,
+    RECVFROM: 207,
+    SETSOCKOPT: 208,
+    GETSOCKOPT: 209,
     GETRANDOM: 278,
   };
 
@@ -209,7 +215,7 @@
     }
   }
 
-  function setupInitialStack(cpu, stackTop, argv = ['/bin/app'], envp = ['PATH=/bin:/usr/bin']) {
+  function setupInitialStack(cpu, stackTop, argv = ['/bin/app'], envp = ['PATH=/bin:/usr/bin'], auxvExtras = []) {
     const enc = new TextEncoder();
     let sp = stackTop >>> 0;
     cpu.ensureMemory(sp + 0x1000);
@@ -230,6 +236,7 @@
     sp &= ~0xf;
 
     const auxv = [
+      ...auxvExtras,
       [6, PAGE_SIZE],
       [11, 0], [12, 0], [13, 0], [14, 0],
       [25, randomPtr],
@@ -287,6 +294,7 @@
         onStdout: hostAdapter.onStdout || (() => {}),
         onStderr: hostAdapter.onStderr || (() => {}),
         readStdinAsync: hostAdapter.readStdinAsync || null,
+        net: hostAdapter.net || null, // { connect(host, port), send(sockId, bytes), recv(sockId, maxLen), close(sockId) }
       };
       this.nextPid = 1;
       this.processes = new Map();
@@ -307,6 +315,37 @@
       if (!proc || proc.state === 'exited') return false;
       proc.pendingSignals.push(sig);
       return true;
+    }
+
+    _loadELFWithInterp(cpu, elfBytes) {
+      const mainInfo = WasmDBT.loadELF64(cpu, elfBytes);
+      let interpBase = 0;
+      let startEntry = mainInfo.entry;
+      let brkStart = mainInfo.brkStart;
+
+      if (mainInfo.interpPath) {
+        const interpBytes = this.fs.readFile(mainInfo.interpPath);
+        if (!interpBytes) {
+          throw new Error(`Dynamic linker not found in VFS: ${mainInfo.interpPath}`);
+        }
+        const interpInfo = WasmDBT.loadELF64(cpu, interpBytes, {
+          loadBias: 0x00180000,
+          noSetPC: false,
+        });
+        interpBase = interpInfo.loadBias;
+        startEntry = interpInfo.entry;
+        brkStart = Math.max(brkStart, interpInfo.brkStart);
+      }
+
+      cpu.setPC(startEntry);
+      const auxvExtras = [
+        [3, mainInfo.phdrVaddr], // AT_PHDR
+        [4, mainInfo.phentsize], // AT_PHENT
+        [5, mainInfo.phnum],     // AT_PHNUM
+        [7, interpBase],         // AT_BASE
+        [9, mainInfo.entry],     // AT_ENTRY
+      ];
+      return { brkStart, auxvExtras };
     }
 
     spawnELF(elfBytes, opts = {}) {
@@ -336,8 +375,8 @@
       };
 
       const cpu = new WasmDBT.GuestCPU(this.engine, () => this._handleSyscall(proc), 64, 4096);
-      const { brkStart } = WasmDBT.loadELF64(cpu, elfBytes);
-      setupInitialStack(cpu, 0x001ff000, argv, opts.envp || ['PATH=/bin:/usr/bin', 'TERM=xterm-256color']);
+      const { brkStart, auxvExtras } = this._loadELFWithInterp(cpu, elfBytes);
+      setupInitialStack(cpu, 0x001ff000, argv, opts.envp || ['PATH=/bin:/usr/bin', 'TERM=xterm-256color'], auxvExtras);
 
       proc.cpu = cpu;
       proc.vmm = new CompactVMM(brkStart, 0x00200000);
@@ -392,7 +431,7 @@
             proc.state = 'blocked';
             if (proc.pendingPromise) blockedPromises.push(proc.pendingPromise);
           } else if (status === STATUS.FAULT) {
-            throw new Error(`Guest fault in pid=${proc.pid} at PC=0x${proc.cpu.getPC().toString(16)}`);
+            throw new Error(`Guest fault in pid=${proc.pid}: ${WasmDBT.formatFaultDiagnostic(proc.cpu)}`);
           }
         }
 
@@ -408,6 +447,7 @@
       for (const fdObj of proc.fds.values()) {
         if (fdObj.kind === 'pipe_r') fdObj.pipe.closeReader();
         if (fdObj.kind === 'pipe_w') fdObj.pipe.closeWriter();
+      if (fdObj.kind === 'socket' && fdObj.sockId && this.host.net) this.host.net.close(fdObj.sockId);
       }
       proc.fds.clear();
       this.exited.set(proc.pid, proc.exitCode);
@@ -438,6 +478,7 @@
       if (!fdObj) return false;
       if (fdObj.kind === 'pipe_r') fdObj.pipe.closeReader();
       if (fdObj.kind === 'pipe_w') fdObj.pipe.closeWriter();
+      if (fdObj.kind === 'socket' && fdObj.sockId && this.host.net) this.host.net.close(fdObj.sockId);
       proc.fds.delete(fd);
       return true;
     }
@@ -483,6 +524,54 @@
         case SYS.MMAP: return ret(proc.vmm.mmap(cpu, a0, a1, a2, a3));
         case SYS.MUNMAP: return ret(proc.vmm.munmap(a0, a1));
         case SYS.MPROTECT: return ret(0);
+
+
+        case SYS.SOCKET: {
+          const fd = proc.nextFd++;
+          proc.fds.set(fd, { kind: 'socket', domain: a0, type: a1, proto: a2, sockId: null });
+          return ret(fd);
+        }
+
+        case SYS.CONNECT: {
+          const fdObj = proc.fds.get(a0);
+          if (!fdObj || fdObj.kind !== 'socket') return ret(-ERRNO.EBADF);
+          if (!this.host.net) return ret(-ERRNO.ENOSYS);
+          const family = cpu.view.getUint16(a1, true);
+          if (family !== 2) return ret(-ERRNO.EINVAL); // AF_INET
+          const port = cpu.view.getUint16(a1 + 2, false); // network byte order (big-endian)
+          const ip = `${cpu.u8[a1 + 4]}.${cpu.u8[a1 + 5]}.${cpu.u8[a1 + 6]}.${cpu.u8[a1 + 7]}`;
+          return this._suspend(
+            proc,
+            this.host.net.connect(ip, port).then((sockId) => {
+              fdObj.sockId = sockId;
+              return 0;
+            })
+          );
+        }
+
+        case SYS.SENDTO: {
+          const fdObj = proc.fds.get(a0);
+          if (!fdObj || fdObj.kind !== 'socket' || !fdObj.sockId || !this.host.net) return ret(-ERRNO.EBADF);
+          const bytes = cpu.u8.slice(a1, a1 + a2);
+          return this._suspend(proc, this.host.net.send(fdObj.sockId, bytes));
+        }
+
+        case SYS.RECVFROM: {
+          const fdObj = proc.fds.get(a0);
+          if (!fdObj || fdObj.kind !== 'socket' || !fdObj.sockId || !this.host.net) return ret(-ERRNO.EBADF);
+          return this._suspend(
+            proc,
+            this.host.net.recv(fdObj.sockId, a2).then((data) => {
+              const n = Math.min(a2, data.length);
+              cpu.u8.set(data.subarray(0, n), a1);
+              return n;
+            })
+          );
+        }
+
+        case SYS.SETSOCKOPT:
+        case SYS.GETSOCKOPT:
+          return ret(0);
 
         case SYS.GETRANDOM: {
           for (let i = 0; i < a1; i++) {
@@ -848,8 +937,8 @@
           proc.exePath = resolved;
           proc.sigHandlers.clear();
           cpu.resetForExec();
-          const { brkStart } = WasmDBT.loadELF64(cpu, elfBytes);
-          setupInitialStack(cpu, 0x001ff000, argv.length ? argv : [path], envp);
+          const { brkStart, auxvExtras } = this._loadELFWithInterp(cpu, elfBytes);
+          setupInitialStack(cpu, 0x001ff000, argv.length ? argv : [path], envp, auxvExtras);
           proc.vmm = new CompactVMM(brkStart, 0x00200000);
           return STATUS.CONTINUE;
         }

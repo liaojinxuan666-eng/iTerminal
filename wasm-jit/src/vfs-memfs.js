@@ -177,6 +177,33 @@
       return true;
     }
 
+
+    serialize() {
+      const entries = [];
+      for (const [path, node] of this.nodes.entries()) {
+        if (path === '/') continue;
+        if (node.type === 'dir') {
+          entries.push({ path, type: 'dir', mode: node.mode });
+        } else if (node.type === 'symlink') {
+          entries.push({ path, type: 'symlink', target: node.target });
+        } else if (node.type === 'file') {
+          entries.push({ path, type: 'file', mode: node.mode, data: Array.from(node.data) });
+        }
+      }
+      return JSON.stringify({ version: 1, entries });
+    }
+
+    static deserialize(jsonStr) {
+      const fs = new MemFS();
+      const parsed = typeof jsonStr === 'string' ? JSON.parse(jsonStr) : jsonStr;
+      for (const e of parsed.entries || []) {
+        if (e.type === 'dir') fs.mkdirp(e.path);
+        else if (e.type === 'symlink') fs.symlink(e.target, e.path);
+        else if (e.type === 'file') fs.writeFile(e.path, new Uint8Array(e.data || []), e.mode & 0o777);
+      }
+      return fs;
+    }
+
     static writeAArch64Stat(dv, ptr, st) {
       for (let i = 0; i < 128; i += 8) dv.setBigUint64(ptr + i, 0n, true);
       dv.setBigUint64(ptr + 0, 1n, true);

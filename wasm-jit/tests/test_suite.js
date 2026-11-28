@@ -621,6 +621,188 @@ async function testSignalInterrupt() {
   console.log(`[PASS] Test 11 (Ctrl-C SIGINT Delivery): spin loop cleanly interrupted with exitCode=${codeExit}`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 12: Dynamic PIE (ET_DYN) + PT_INTERP Dynamic Linker Boot & auxv Handshake
+// ---------------------------------------------------------------------------
+async function testDynamicPIEAndInterp() {
+  // Build a PIE (ET_DYN) ELF64 binary with PT_INTERP="/lib/ld-musl-aarch64.so.1"
+  function buildPIEWithInterp(codeInsns, interpStr) {
+    const codeSize = codeInsns.length * 4;
+    const interpBytes = new TextEncoder().encode(interpStr + '\0');
+    const ehdrSize = 64;
+    const phdrSize = 56;
+    const phnum = 2; // PT_LOAD + PT_INTERP
+    const fileOff = 0x100;
+    const interpOff = fileOff + ((codeSize + 15) & ~15);
+    const total = interpOff + interpBytes.length;
+    const buf = new Uint8Array(total);
+    const dv = new DataView(buf.buffer);
+
+    buf[0] = 0x7f; buf[1] = 0x45; buf[2] = 0x4c; buf[3] = 0x46;
+    buf[4] = 2; buf[5] = 1; buf[6] = 1;
+    dv.setUint16(16, 3, true);      // ET_DYN (PIE!)
+    dv.setUint16(18, 183, true);    // EM_AARCH64
+    dv.setUint32(20, 1, true);
+    dv.setBigUint64(24, 0n, true);  // e_entry = 0 (relative to loadBias!)
+    dv.setBigUint64(32, BigInt(ehdrSize), true);
+    dv.setUint16(52, ehdrSize, true);
+    dv.setUint16(54, phdrSize, true);
+    dv.setUint16(56, phnum, true);
+
+    // PHDR 0: PT_LOAD at vaddr 0
+    dv.setUint32(ehdrSize + 0, 1, true);
+    dv.setUint32(ehdrSize + 4, 7, true);
+    dv.setBigUint64(ehdrSize + 8, BigInt(fileOff), true);
+    dv.setBigUint64(ehdrSize + 16, 0n, true);
+    dv.setBigUint64(ehdrSize + 24, 0n, true);
+    dv.setBigUint64(ehdrSize + 32, BigInt(codeSize), true);
+    dv.setBigUint64(ehdrSize + 40, BigInt(codeSize), true);
+    dv.setBigUint64(ehdrSize + 48, 0x1000n, true);
+
+    // PHDR 1: PT_INTERP
+    const p1 = ehdrSize + phdrSize;
+    dv.setUint32(p1 + 0, 3, true);
+    dv.setUint32(p1 + 4, 4, true);
+    dv.setBigUint64(p1 + 8, BigInt(interpOff), true);
+    dv.setBigUint64(p1 + 16, 0n, true);
+    dv.setBigUint64(p1 + 24, 0n, true);
+    dv.setBigUint64(p1 + 32, BigInt(interpBytes.length), true);
+    dv.setBigUint64(p1 + 40, BigInt(interpBytes.length), true);
+    dv.setBigUint64(p1 + 48, 1n, true);
+
+    for (let i = 0; i < codeInsns.length; i++) dv.setUint32(fileOff + i * 4, codeInsns[i], true);
+    buf.set(interpBytes, interpOff);
+    return buf;
+  }
+
+  // Mock ld-musl-aarch64.so.1 (ET_DYN):
+  //   Stack layout with argc=1, envc=2:
+  //     [sp+0]=argc(1), [sp+8]=argv[0], [sp+16]=0, [sp+24]=env[0], [sp+32]=env[1], [sp+40]=0
+  //     auxv starts at sp+48:
+  //       +48: AT_PHDR(3), +64: AT_PHENT(4), +80: AT_PHNUM(5), +96: AT_BASE(7), +112: AT_ENTRY(9)
+  //   Load AT_BASE into x20, AT_ENTRY into x21, then BR x21 (jump into PIE main!)
+  const ldCode = [
+    A64.ldr64(20, 31, 104), // AT_BASE value (expect 0x180000)
+    A64.ldr64(21, 31, 120), // AT_ENTRY value (expect 0x40000)
+    A64.br(21),             // jump to PIE main!
+  ];
+  // Build ld-musl as ET_DYN too (no PT_INTERP)
+  const { elf: ldRaw } = buildELF64(ldCode, new Uint8Array(0), 0);
+  new DataView(ldRaw.buffer).setUint16(16, 3, true); // mark ET_DYN
+
+  // PIE main: sets x19 = 0x2026 and exits cleanly
+  const pieMain = buildPIEWithInterp(
+    [A64.movz(19, 0x2026), A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0)],
+    '/lib/ld-musl-aarch64.so.1'
+  );
+
+  const fs = new MemFS();
+  fs.writeFile('/lib/ld-musl-aarch64.so.1', ldRaw, 0o755);
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), { fs });
+  const proc = kernel.spawnELF(pieMain, { argv: ['/bin/pie_app'] });
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(20), 0x180000n, 'AT_BASE mismatch');
+  assert.strictEqual(proc.cpu.getReg(21), 0x40000n, 'AT_ENTRY mismatch');
+  assert.strictEqual(proc.cpu.getReg(19), 0x2026n, 'PIE main did not execute');
+  console.log(
+    `[PASS] Test 12 (Dynamic PIE + PT_INTERP): ld-musl@0x${proc.cpu
+      .getReg(20)
+      .toString(16)} -> PIE@0x${proc.cpu.getReg(21).toString(16)} (x19=0x2026)`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Async BSD TCP Socket (socket -> connect -> sendto -> recvfrom -> close)
+// ---------------------------------------------------------------------------
+async function testAsyncBSDSocket() {
+  // sockaddr_in (16 bytes) for 127.0.0.1:8080 + payload "PING"
+  const data = new Uint8Array(32);
+  const dv = new DataView(data.buffer);
+  dv.setUint16(0, 2, true);       // AF_INET
+  dv.setUint16(2, 8080, false);   // port 8080 (big-endian)
+  data[4] = 127; data[5] = 0; data[6] = 0; data[7] = 1;
+  data.set(new TextEncoder().encode('PING'), 16);
+
+  const code = [
+    A64.subImm(31, 31, 64),
+    // socket(AF_INET=2, SOCK_STREAM=1, 0) -> x19
+    A64.movz(0, 2), A64.movz(1, 1), A64.movz(2, 0), A64.movz(8, SYS.SOCKET), A64.svc(0),
+    A64.movReg(19, 0),
+    // connect(fd, sockaddr, 16)
+    A64.movReg(0, 19), A64.movz(1, 0, 0), A64.movk(1, 0, 1), A64.movz(2, 16), A64.movz(8, SYS.CONNECT), A64.svc(0),
+    // sendto(fd, "PING", 4, 0, 0, 0)
+    A64.movReg(0, 19), A64.movz(1, 0, 0), A64.movk(1, 0, 1), A64.movz(2, 4), A64.movz(8, SYS.SENDTO), A64.svc(0),
+    // recvfrom(fd, sp, 32, 0, 0, 0) -> write(1, sp, n)
+    A64.movReg(0, 19), A64.addImm(1, 31, 0), A64.movz(2, 32), A64.movz(8, SYS.RECVFROM), A64.svc(0),
+    A64.movReg(2, 0), A64.movz(0, 1), A64.addImm(1, 31, 0), A64.movz(8, SYS.WRITE), A64.svc(0),
+    // close(fd); exit(0)
+    A64.movReg(0, 19), A64.movz(8, SYS.CLOSE), A64.svc(0),
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+
+  const baseVaddr = 0x10000;
+  const dataOff = (code.length * 4 + 15) & ~15;
+  const sockAddrPtr = baseVaddr + dataOff;
+  const pingPtr = sockAddrPtr + 16;
+  code[8] = A64.movz(1, sockAddrPtr & 0xffff, 0);
+  code[9] = A64.movk(1, (sockAddrPtr >>> 16) & 0xffff, 1);
+  code[14] = A64.movz(1, pingPtr & 0xffff, 0);
+  code[15] = A64.movk(1, (pingPtr >>> 16) & 0xffff, 1);
+
+  const { elf } = buildELF64(code, data, baseVaddr);
+  let stdout = '';
+  let connectedTarget = '';
+  let closedSock = 0;
+
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine(), {
+    onStdout: (b) => { stdout += new TextDecoder().decode(b); },
+    net: {
+      connect: async (ip, port) => {
+        connectedTarget = `${ip}:${port}`;
+        return 101;
+      },
+      send: async (sockId, bytes) => {
+        assert.strictEqual(sockId, 101);
+        assert.strictEqual(new TextDecoder().decode(bytes), 'PING');
+        return bytes.length;
+      },
+      recv: async (sockId) => {
+        assert.strictEqual(sockId, 101);
+        return new TextEncoder().encode('PONG-FROM-IOS-NWCONNECTION');
+      },
+      close: (sockId) => { closedSock = sockId; },
+    },
+  });
+  kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(connectedTarget, '127.0.0.1:8080');
+  assert.strictEqual(stdout, 'PONG-FROM-IOS-NWCONNECTION');
+  assert.strictEqual(closedSock, 101);
+  console.log(`[PASS] Test 13 (Async BSD TCP Socket): connected ${connectedTarget}, recv="${stdout}"`);
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: MemFS Snapshot Serialization & Restore (iOS Sandbox Persistence)
+// ---------------------------------------------------------------------------
+async function testMemFSPersistence() {
+  const fs1 = new MemFS();
+  fs1.writeFile('/etc/profile', 'export PS1="iTerminal$ "\n', 0o644);
+  fs1.writeFile('/bin/busybox', new Uint8Array([0x7f, 0x45, 0x4c, 0x46]), 0o755);
+  fs1.symlink('/bin/busybox', '/bin/sh');
+
+  const snapshot = fs1.serialize();
+  const fs2 = MemFS.deserialize(snapshot);
+
+  assert.strictEqual(new TextDecoder().decode(fs2.readFile('/etc/profile')), 'export PS1="iTerminal$ "\n');
+  assert.strictEqual(fs2.readlink('/bin/sh'), '/bin/busybox');
+  assert.deepStrictEqual(Array.from(fs2.readFile('/bin/sh')), [0x7f, 0x45, 0x4c, 0x46]);
+  console.log(`[PASS] Test 14 (MemFS Persistence Snapshot): serialized ${snapshot.length}B & restored cleanly`);
+}
+
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -633,7 +815,10 @@ async function testSignalInterrupt() {
   await testMuslPrintfMemcpyISA();
   await testBusyBoxSymlinkAndTTY();
   await testSignalInterrupt();
-  console.log('\nALL 11 TESTS PASSED.');
+  await testDynamicPIEAndInterp();
+  await testAsyncBSDSocket();
+  await testMemFSPersistence();
+  console.log('\nALL 14 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

@@ -1433,7 +1433,7 @@
     }
   }
 
-  function loadELF64(cpu, elfBytes) {
+  function loadELF64(cpu, elfBytes, opts = {}) {
     const dv = new DataView(elfBytes.buffer, elfBytes.byteOffset, elfBytes.byteLength);
     if (
       dv.getUint8(0) !== 0x7f ||
@@ -1443,34 +1443,81 @@
     ) {
       throw new Error('Not an ELF binary');
     }
+    const eType = dv.getUint16(16, true); // 2=ET_EXEC, 3=ET_DYN (PIE/shared)
     const eMachine = dv.getUint16(18, true);
     if (eMachine !== 183) throw new Error(`Unsupported ELF machine ${eMachine}, expected AArch64 (183)`);
-    const entry = Number(dv.getBigUint64(24, true));
+    const rawEntry = Number(dv.getBigUint64(24, true));
     const phoff = Number(dv.getBigUint64(32, true));
     const phentsize = dv.getUint16(54, true);
     const phnum = dv.getUint16(56, true);
 
+    // Rebase ET_DYN (PIE / ld-musl) to a safe non-zero compact 32-bit base
+    const loadBias = eType === 3 ? (opts.loadBias ?? 0x00040000) : 0;
+
+    let minVaddr = Infinity;
     let maxEnd = 0x10000;
+    let interpPath = null;
+    let phdrVaddr = 0;
+
     for (let i = 0; i < phnum; i++) {
       const off = phoff + i * phentsize;
       const pType = dv.getUint32(off, true);
-      if (pType !== 1) continue;
       const pOffset = Number(dv.getBigUint64(off + 8, true));
       const pVaddr = Number(dv.getBigUint64(off + 16, true));
       const pFilesz = Number(dv.getBigUint64(off + 32, true));
       const pMemsz = Number(dv.getBigUint64(off + 40, true));
 
-      cpu.ensureMemory(pVaddr + pMemsz + 0x10000);
-      cpu.u8.set(elfBytes.subarray(pOffset, pOffset + pFilesz), pVaddr);
-      if (pMemsz > pFilesz) {
-        cpu.u8.fill(0, pVaddr + pFilesz, pVaddr + pMemsz);
+      if (pType === 3) {
+        // PT_INTERP
+        const slice = elfBytes.subarray(pOffset, pOffset + pFilesz);
+        let len = slice.length;
+        while (len > 0 && slice[len - 1] === 0) len--;
+        interpPath = new TextDecoder().decode(slice.subarray(0, len));
+        continue;
       }
-      if (pVaddr + pMemsz > maxEnd) maxEnd = pVaddr + pMemsz;
+      if (pType === 6) {
+        // PT_PHDR
+        phdrVaddr = loadBias + pVaddr;
+        continue;
+      }
+      if (pType !== 1) continue; // PT_LOAD
+
+      const dst = loadBias + pVaddr;
+      if (dst < minVaddr) minVaddr = dst;
+      cpu.ensureMemory(dst + pMemsz + 0x10000);
+      cpu.u8.set(elfBytes.subarray(pOffset, pOffset + pFilesz), dst);
+      if (pMemsz > pFilesz) {
+        cpu.u8.fill(0, dst + pFilesz, dst + pMemsz);
+      }
+      if (dst + pMemsz > maxEnd) maxEnd = dst + pMemsz;
     }
 
+    if (!phdrVaddr && minVaddr !== Infinity) {
+      phdrVaddr = minVaddr + phoff;
+    }
+    const entry = loadBias + rawEntry;
     const brkStart = (maxEnd + 0xfff) & ~0xfff;
-    cpu.setPC(entry);
-    return { entry, brkStart };
+    if (!opts.noSetPC) cpu.setPC(entry);
+    return {
+      entry,
+      brkStart,
+      loadBias,
+      eType,
+      interpPath,
+      phdrVaddr,
+      phentsize,
+      phnum,
+    };
+  }
+
+  function formatFaultDiagnostic(cpu) {
+    const pc = cpu.getPC();
+    const raw = pc + 4 <= cpu.view.byteLength ? cpu.view.getUint32(pc, true) : 0;
+    const regs = [];
+    for (let i = 0; i < 8; i++) regs.push(`x${i}=0x${cpu.getReg(i).toString(16)}`);
+    return `PC=0x${pc.toString(16)} insn=0x${raw.toString(16).padStart(8, '0')} sp=0x${cpu
+      .getReg(31)
+      .toString(16)} lr=0x${cpu.getReg(30).toString(16)} [${regs.join(' ')}]`;
   }
 
   return {
@@ -1487,6 +1534,7 @@
     DBTEngine,
     GuestCPU,
     loadELF64,
+    formatFaultDiagnostic,
     translateBasicBlock,
     decodeBitMasks,
   };
