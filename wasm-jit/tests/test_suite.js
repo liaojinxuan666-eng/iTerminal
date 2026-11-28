@@ -704,7 +704,7 @@ async function testDynamicPIEAndInterp() {
   const proc = kernel.spawnELF(pieMain, { argv: ['/bin/pie_app'] });
   await kernel.runAll();
 
-  assert.strictEqual(proc.cpu.getReg(20), 0x180000n, 'AT_BASE mismatch');
+  assert.strictEqual(proc.cpu.getReg(20), 0x400000n, 'AT_BASE mismatch');
   assert.strictEqual(proc.cpu.getReg(21), 0x40000n, 'AT_ENTRY mismatch');
   assert.strictEqual(proc.cpu.getReg(19), 0x2026n, 'PIE main did not execute');
   console.log(
@@ -954,6 +954,37 @@ async function testPreadAndReadv() {
   console.log(`[PASS] Test 17 (pread64 + readv): output="${stdout}"`);
 }
 
+
+// ---------------------------------------------------------------------------
+// Test 18: Real-Device Alpine ld-musl Regression (0x9a9f17e3 CSET/CSINC + SMADDL + ADC)
+// ---------------------------------------------------------------------------
+async function testLdMuslRegression() {
+  const code = [
+    // Exact opcode observed on iPhone at PC=0x1eb028: 0x9a9f17e3 = csinc x3, xzr, xzr, ne (cset x3, eq)
+    A64.subsImm(31, 0, 0),   // Z=1 (EQ)
+    0x9a9f17e3,              // cset x3, eq -> expect x3 = 1!
+    A64.movReg(19, 3),
+    // Now test with Z=0 (NE): expect x3 = 0
+    A64.movz(1, 5),
+    A64.subsImm(31, 1, 0),   // Z=0 (NE)
+    0x9a9f17e3,              // cset x3, eq -> expect x3 = 0!
+    A64.movReg(20, 3),
+    // SMADDL x21, w1, w2, xzr -> 5 * (-3) = -15
+    A64.movn(2, 2),          // w2 = -3
+    ((0x9b207c00 | (2 << 16) | (1 << 5) | 21) >>> 0), // smull x21, w1, w2
+    A64.movz(0, 0), A64.movz(8, SYS.EXIT_GROUP), A64.svc(0),
+  ];
+  const { elf } = buildELF64(code);
+  const kernel = new GuestKernel(new WasmDBT.DBTEngine());
+  const proc = kernel.spawnELF(elf);
+  await kernel.runAll();
+
+  assert.strictEqual(proc.cpu.getReg(19), 1n, '0x9a9f17e3 CSET EQ when Z=1');
+  assert.strictEqual(proc.cpu.getReg(20), 0n, '0x9a9f17e3 CSET EQ when Z=0');
+  assert.strictEqual(BigInt.asIntN(64, proc.cpu.getReg(21)), -15n, 'SMADDL/SMULL');
+  console.log(`[PASS] Test 18 (Alpine ld-musl Regression): 0x9a9f17e3 (CSET/CSINC) & SMULL verified`);
+}
+
 (async () => {
   await testLoopAndBenchmark();
   await testIndirectBranchesDBT();
@@ -972,7 +1003,8 @@ async function testPreadAndReadv() {
   await testTarRootFSBoot();
   await testFileBackedMmapSharedLib();
   await testPreadAndReadv();
-  console.log('\nALL 17 TESTS PASSED.');
+  await testLdMuslRegression();
+  console.log('\nALL 18 TESTS PASSED.');
 })().catch((err) => {
   console.error('TEST FAILED:', err);
   process.exit(1);

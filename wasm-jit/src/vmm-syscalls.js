@@ -119,7 +119,7 @@
   };
 
   class CompactVMM {
-    constructor(brkStart, mmapBase = 0x00200000) {
+    constructor(brkStart, mmapBase = 0x01000000) {
       this.brkStart = alignUp(brkStart, PAGE_SIZE);
       this.brkCurrent = this.brkStart;
       this.mmapBase = Math.max(alignUp(mmapBase, PAGE_SIZE), this.brkStart + 0x100000);
@@ -345,7 +345,7 @@
           throw new Error(`Dynamic linker not found in VFS: ${mainInfo.interpPath}`);
         }
         const interpInfo = WasmDBT.loadELF64(cpu, interpBytes, {
-          loadBias: 0x00180000,
+          loadBias: 0x00400000,
           noSetPC: false,
         });
         interpBase = interpInfo.loadBias;
@@ -390,12 +390,12 @@
         cpu: null,
       };
 
-      const cpu = new WasmDBT.GuestCPU(this.engine, () => this._handleSyscall(proc), 64, 4096);
+      const cpu = new WasmDBT.GuestCPU(this.engine, () => this._handleSyscall(proc), 256, 8192);
       const { brkStart, auxvExtras } = this._loadELFWithInterp(cpu, elfBytes);
-      setupInitialStack(cpu, 0x001ff000, argv, opts.envp || ['PATH=/bin:/usr/bin', 'TERM=xterm-256color'], auxvExtras);
+      setupInitialStack(cpu, 0x00fff000, argv, opts.envp || ['PATH=/bin:/usr/bin', 'TERM=xterm-256color'], auxvExtras);
 
       proc.cpu = cpu;
-      proc.vmm = new CompactVMM(brkStart, 0x00200000);
+      proc.vmm = new CompactVMM(Math.max(brkStart, 0x00800000), 0x01000000);
       this.processes.set(pid, proc);
       return proc;
     }
@@ -1024,8 +1024,8 @@
           proc.sigHandlers.clear();
           cpu.resetForExec();
           const { brkStart, auxvExtras } = this._loadELFWithInterp(cpu, elfBytes);
-          setupInitialStack(cpu, 0x001ff000, argv.length ? argv : [path], envp, auxvExtras);
-          proc.vmm = new CompactVMM(brkStart, 0x00200000);
+          setupInitialStack(cpu, 0x00fff000, argv.length ? argv : [path], envp, auxvExtras);
+          proc.vmm = new CompactVMM(Math.max(brkStart, 0x00800000), 0x01000000);
           return STATUS.CONTINUE;
         }
 

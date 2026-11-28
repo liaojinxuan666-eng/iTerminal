@@ -661,7 +661,7 @@
       }
 
       // 17. Conditional Select: CSEL, CSINC, CSINV, CSNEG
-      if (((insn & 0x1fe00c00) >>> 0) === 0x1a800000) {
+      if (((insn & 0x1fe00800) >>> 0) === 0x1a800000) {
         const is64 = (insn >>> 31) === 1;
         const isInv = ((insn >>> 30) & 1) === 1;
         const rm = (insn >>> 16) & 0x1f;
@@ -830,11 +830,13 @@
         const size = (insn >>> 30) & 0x3;
         const opc = (insn >>> 22) & 0x3;
         const rm = (insn >>> 16) & 0x1f;
+        const option = (insn >>> 13) & 0x7;
         const sBit = ((insn >>> 12) & 1) === 1;
         const rn = (insn >>> 5) & 0x1f;
         const rt = insn & 0x1f;
         c.getReg(rn, true, false);
         c.getReg(rm, false, false);
+        emitExtend(c, option);
         if (sBit && size > 0) {
           c.i64Const(BigInt(size));
           c.op(OP.I64_SHL);
@@ -862,7 +864,7 @@
         const offset = imm7 * scale;
 
         c.getReg(rn, true, false);
-        if (mode === 2 || mode === 3) {
+        if (mode === 0 || mode === 2 || mode === 3) {
           c.i64Const(BigInt(offset));
           c.op(OP.I64_ADD);
         }
@@ -1074,7 +1076,7 @@
         const offset = imm7 * 16;
 
         c.getReg(rn, true, false);
-        if (mode === 2 || mode === 3) {
+        if (mode === 0 || mode === 2 || mode === 3) {
           c.i64Const(BigInt(offset));
           c.op(OP.I64_ADD);
         }
@@ -1171,6 +1173,106 @@
             c.i64Const(BigInt(imm9));
             c.op(OP.I64_ADD);
             c.endSetReg(rn, true, false);
+          }
+        }
+        pc = nextPC;
+        continue;
+      }
+
+
+      // 34. ADC / ADCS / SBC / SBCS
+      if (((insn & 0x1fe0fc00) >>> 0) === 0x1a000000) {
+        const is64 = (insn >>> 31) === 1;
+        const isSub = ((insn >>> 30) & 1) === 1;
+        const setFlags = ((insn >>> 29) & 1) === 1;
+        const rm = (insn >>> 16) & 0x1f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        c.getReg(rn, false, !is64);
+        c.localSet(0);
+        // operand2 = rm + carry (for ADC) or rm + (1 - carry) (for SBC)
+        c.getReg(rm, false, !is64);
+        c.i32Const(OFF_C);
+        c.loadI32(0, 2);
+        if (isSub) { c.i32Const(1); c.op(OP.I32_XOR); }
+        c.op(OP.I64_EXTEND_I32_U, OP.I64_ADD);
+        c.localSet(1);
+        emitAddSub(c, is64, isSub, setFlags, rd, false);
+        pc = nextPC;
+        continue;
+      }
+
+      // 35. SMADDL / SMSUBL / UMADDL / UMSUBL (32x32->64 multiply-add/sub)
+      if (((insn & 0xff200000) >>> 0) === 0x9b200000) {
+        const isUnsigned = ((insn >>> 23) & 1) === 1;
+        const isSub = ((insn >>> 15) & 1) === 1;
+        const rm = (insn >>> 16) & 0x1f;
+        const ra = (insn >>> 10) & 0x1f;
+        const rn = (insn >>> 5) & 0x1f;
+        const rd = insn & 0x1f;
+        if (c.beginSetReg(rd, false)) {
+          c.getReg(ra, false, false);
+          c.getReg(rn, false, true);
+          if (!isUnsigned) c.op(OP.I32_WRAP_I64, OP.I64_EXTEND_I32_S);
+          c.getReg(rm, false, true);
+          if (!isUnsigned) c.op(OP.I32_WRAP_I64, OP.I64_EXTEND_I32_S);
+          c.op(OP.I64_MUL);
+          c.op(isSub ? OP.I64_SUB : OP.I64_ADD);
+          c.endSetReg(rd, false, false);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 36. 64-bit FP/SIMD D-reg LDR/STR unsigned offset (0xFD000000 / 0xFD400000)
+      if (((insn & 0xff800000) >>> 0) === 0xfd000000 || ((insn & 0xff800000) >>> 0) === 0xfd400000) {
+        const isLoad = ((insn >>> 22) & 1) === 1;
+        const imm12 = (insn >>> 10) & 0xfff;
+        const rn = (insn >>> 5) & 0x1f;
+        const dt = insn & 0x1f;
+        c.getReg(rn, true, false);
+        if (imm12 > 0) { c.i64Const(BigInt(imm12 * 8)); c.op(OP.I64_ADD); }
+        c.op(OP.I32_WRAP_I64);
+        c.localSet(3);
+        if (isLoad) {
+          c.i32Const(OFF_Q(dt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
+        } else {
+          c.localGet(3); c.i32Const(OFF_Q(dt)); c.loadI64(0, 3); c.storeI64(0, 3);
+        }
+        pc = nextPC;
+        continue;
+      }
+
+      // 37. 64-bit FP/SIMD D-reg LDP/STP (opc=01, V=1: 0x6C000000..0x6DC00000)
+      if (
+        ((insn & 0xfe400000) >>> 0) === 0x6c000000 ||
+        ((insn & 0xfe400000) >>> 0) === 0x6c400000 ||
+        ((insn & 0xfe400000) >>> 0) === 0x6d000000 ||
+        ((insn & 0xfe400000) >>> 0) === 0x6d400000 ||
+        ((insn & 0xfe400000) >>> 0) === 0x6d800000 ||
+        ((insn & 0xfe400000) >>> 0) === 0x6dc00000
+      ) {
+        const mode = (insn >>> 23) & 0x3;
+        const isLoad = ((insn >>> 22) & 1) === 1;
+        const imm7 = signExtend((insn >>> 15) & 0x7f, 7);
+        const dt2 = (insn >>> 10) & 0x1f;
+        const rn = (insn >>> 5) & 0x1f;
+        const dt = insn & 0x1f;
+        const offset = imm7 * 8;
+        c.getReg(rn, true, false);
+        if (mode === 0 || mode === 2 || mode === 3) { c.i64Const(BigInt(offset)); c.op(OP.I64_ADD); }
+        c.op(OP.I32_WRAP_I64);
+        c.localSet(3);
+        if (isLoad) {
+          c.i32Const(OFF_Q(dt)); c.localGet(3); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.i32Const(OFF_Q(dt2)); c.localGet(3); c.loadI64(8, 3); c.storeI64(0, 3);
+        } else {
+          c.localGet(3); c.i32Const(OFF_Q(dt)); c.loadI64(0, 3); c.storeI64(0, 3);
+          c.localGet(3); c.i32Const(OFF_Q(dt2)); c.loadI64(0, 3); c.storeI64(8, 3);
+        }
+        if (mode === 1 || mode === 3) {
+          if (c.beginSetReg(rn, true)) {
+            c.getReg(rn, true, false); c.i64Const(BigInt(offset)); c.op(OP.I64_ADD); c.endSetReg(rn, true, false);
           }
         }
         pc = nextPC;
